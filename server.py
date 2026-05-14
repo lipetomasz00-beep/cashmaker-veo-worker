@@ -22,7 +22,7 @@ def generate_video():
         aspect_ratio="9:16",
         number_of_videos=1,
         duration_seconds=8,
-        resolution="1080p",
+        resolution="720p",
     )
 
     operation = client.models.generate_videos(
@@ -32,23 +32,17 @@ def generate_video():
     )
 
     while not operation.done:
-        time.sleep(10)
+        time.sleep(5)
         operation = client.operations.get(operation)
 
     result = operation.result
 
     generated_video = result.generated_videos[0]
 
-    client.files.download(file=generated_video.video)
-
-    filename = f"video_{int(time.time())}.mp4"
-
-    generated_video.video.save(filename)
-
     return jsonify({
-        "status": "success",
-        "file": filename
-    })
+    "status": "success",
+    "video_url": generated_video.video.uri
+}) 
 
-if __name__ == "__main__":
+    if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
