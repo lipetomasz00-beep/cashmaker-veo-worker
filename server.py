@@ -31,18 +31,23 @@ def generate():
 
         print(f"Rozpoczynam proces generowania dla: {prompt}")
 
-        # 1. Zlecenie wideo (Składnia poprawiona, by uniknąć AttributeError)
-        operation = client.models.generate_videos(
-            model=MODEL,
-            prompt=prompt,
-            config=types.GenerateVideosConfig(
-                person_generation="dont_allow",
-                aspect_ratio="9:16",
-                duration_seconds=8,
-                resolution="1080p",
-            ),
-        )
+    operation = client.models.generate_videos(
 
+            model=MODEL,
+
+            prompt=prompt,
+
+           config=types.GenerateVideosConfig(
+
+                aspect_ratio="9:16",
+
+                duration_seconds=8,
+
+                resolution="1080p",
+
+            ),
+
+        )
         # 2. Czekanie na zakończenie operacji (Polling)
         while not operation.done:
             print("Wideo wciąż się generuje... sprawdzam za 10s")
