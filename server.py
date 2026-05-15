@@ -42,7 +42,6 @@ def generate_video():
     return jsonify({
     "status": "success",
     "video_url": generated_video.video.uri
-}) 
-
-    if __name__ == "__main__":
+})
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
