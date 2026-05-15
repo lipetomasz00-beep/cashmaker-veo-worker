@@ -27,7 +27,9 @@ def generate_video():
 
     operation = client.models.generate_videos(
         model=MODEL,
-        prompt=prompt,
+        source=types.VideoGenerationSource(
+            prompt=prompt,
+        ),
         config=video_config,
     )
 
@@ -40,8 +42,9 @@ def generate_video():
     generated_video = result.generated_videos[0]
 
     return jsonify({
-    "status": "success",
-    "video_url": generated_video.video.uri
-})
+        "status": "success",
+        "video_url": generated_video.video.uri
+    })
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
