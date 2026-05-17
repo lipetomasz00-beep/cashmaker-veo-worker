@@ -189,7 +189,7 @@ def generate():
 
         # Get result with proper error handling
         try:
-            result = operation.result()
+            result = operation.result
         except Exception as e:
             logger.error(f"Failed to get operation result: {str(e)}")
             return jsonify({"error": f"Failed to retrieve generation result: {str(e)}"}), 500
