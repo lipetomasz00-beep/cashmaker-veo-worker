@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-MODEL = "veo-3.1-fast-generate-preview"
+MODEL = "veo-3.1-lite-generate-preview"
 BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "wiadrofilmy")
 POLLING_INTERVAL = 10
 MAX_POLLING_ATTEMPTS = 60  # Reduced to 10 minutes (more reasonable for HTTP)
@@ -72,7 +72,9 @@ def download_video_from_uri(video_uri, temp_path):
     start_time = time.time()
     
     try:
-        response = requests.get(video_uri, timeout=REQUEST_TIMEOUT, stream=True)
+        api_key = os.environ.get("GEMINI_API_KEY")
+        headers = {"x-goog-api-key": api_key}
+        response = requests.get(video_uri, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)       
         response.raise_for_status()
         
         # Check content length before downloading
