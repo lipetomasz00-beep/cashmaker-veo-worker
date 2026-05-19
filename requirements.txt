@@ -1,6 +1,5 @@
 google-genai>=0.3.0
 flask
 gunicorn
-google-cloud-storage
 google-auth
 requests
