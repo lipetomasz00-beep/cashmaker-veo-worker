@@ -20,14 +20,13 @@ app = Flask(__name__)
 MODEL = "veo-3.1-lite-generate-preview"
 STORAGE_DIR = '/app/data'
 POLLING_INTERVAL = 10
-MAX_POLLING_ATTEMPTS = 60  # Reduced to 10 minutes (more reasonable for HTTP)
-MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500MB max
-REQUEST_TIMEOUT = 120  # 2 minutes timeout for HTTP requests
+MAX_POLLING_ATTEMPTS = 60
+MAX_VIDEO_SIZE = 500 * 1024 * 1024
+REQUEST_TIMEOUT = 120
+SEQUENCE_DELAY = 15
 
-# Ensure local storage directory exists
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-# Initialize on startup
 try:
     client = genai.Client(
         http_options={"api_version": "v1beta"},
@@ -49,7 +48,6 @@ def download_video_from_uri(video_uri, temp_path):
         response = requests.get(video_uri, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)       
         response.raise_for_status()
         
-        # Check content length before downloading
         content_length = response.headers.get('content-length')
         if content_length and int(content_length) > MAX_VIDEO_SIZE:
             raise ValueError(f"Video size {content_length} exceeds maximum {MAX_VIDEO_SIZE}")
@@ -79,7 +77,6 @@ def save_video_locally(temp_path, video_id):
     start_time = time.time()
 
     try:
-        # Verify file exists and is not empty
         if not os.path.exists(temp_path):
             raise FileNotFoundError(f"Temporary file not found: {temp_path}")
 
@@ -102,13 +99,79 @@ def save_video_locally(temp_path, video_id):
         logger.error(f"Failed to save video locally: {str(e)}")
         raise
 
+def generate_single_video(prompt, aspect_ratio="9:16"):
+    """Generate a single video and return filename or None on error"""
+    temp_path = None
+    video_id = f"{int(time.time())}_{os.urandom(4).hex()}"
+    
+    try:
+        logger.info(f"Generating video for prompt: {prompt[:50]}...")
+        
+        operation = client.models.generate_videos(
+            model=MODEL,
+            prompt=prompt,
+            config=types.GenerateVideosConfig(
+                aspect_ratio=aspect_ratio,
+                duration_seconds=8,
+                resolution="1080p",
+            ),
+        )
+        logger.info(f"Video generation operation started: {operation.name}")
+        
+        attempt = 0
+        while not operation.done and attempt < MAX_POLLING_ATTEMPTS:
+            logger.info(f"Polling video status (attempt {attempt + 1}/{MAX_POLLING_ATTEMPTS})...")
+            time.sleep(POLLING_INTERVAL)
+            
+            try:
+                operation = client.operations.get(operation)
+            except Exception as e:
+                logger.error(f"Failed to get operation status: {str(e)}")
+                raise
+            
+            attempt += 1
+        
+        if not operation.done:
+            logger.error(f"Video generation timeout after {attempt * POLLING_INTERVAL}s")
+            return None
+        
+        result = operation.result
+        if not result or not hasattr(result, 'generated_videos') or not result.generated_videos:
+            logger.error("No generated videos in result")
+            return None
+        
+        generated_video = result.generated_videos[0]
+        if not generated_video or not hasattr(generated_video, 'video') or not generated_video.video:
+            logger.error("Invalid video object in result")
+            return None
+        
+        if not hasattr(generated_video.video, 'uri') or not generated_video.video.uri:
+            logger.error("No URI in generated video")
+            return None
+        
+        temp_path = f"/tmp/v_{video_id}.mp4"
+        download_video_from_uri(generated_video.video.uri, temp_path)
+        
+        filename = save_video_locally(temp_path, video_id)
+        logger.info(f"Video generated successfully: {filename}")
+        return filename
+        
+    except Exception as e:
+        logger.error(f"Error generating video: {str(e)}")
+        return None
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup temporary file: {cleanup_error}")
+
 @app.route("/render", methods=["POST"])
 def render():
     temp_path = None
     start_time = time.time()
 
     try:
-        # Validate request data
         data = request.json
         if not data:
             logger.warning("No JSON data provided in request")
@@ -119,7 +182,6 @@ def render():
             logger.warning("Missing or empty prompt in request")
             return jsonify({"error": "Missing or empty prompt"}), 400
 
-        # Handle aspectRatio parameter
         aspect_ratio = data.get("aspectRatio", "9:16")
         valid_aspect_ratios = {"9:16", "16:9", "1:1"}
         if aspect_ratio not in valid_aspect_ratios:
@@ -128,7 +190,6 @@ def render():
 
         logger.info(f"Starting video generation for prompt: {prompt[:50]}...")
 
-        # Generate video
         try:
             operation = client.models.generate_videos(
                 model=MODEL,
@@ -144,7 +205,6 @@ def render():
             logger.error(f"Failed to start video generation: {str(e)}")
             raise
 
-        # Poll for completion with timeout
         attempt = 0
         while not operation.done and attempt < MAX_POLLING_ATTEMPTS:
             logger.info(f"Polling video status (attempt {attempt + 1}/{MAX_POLLING_ATTEMPTS})...")
@@ -163,7 +223,6 @@ def render():
             logger.error(f"Video generation timeout after {elapsed:.2f}s")
             return jsonify({"error": "Video generation timeout"}), 504
 
-        # Get result with proper error handling
         try:
             result = operation.result
         except Exception as e:
@@ -187,7 +246,6 @@ def render():
             logger.error("No URI in generated video")
             return jsonify({"error": "Invalid video URI"}), 500
 
-        # Download video
         video_id = f"{int(time.time())}_{os.urandom(4).hex()}"
         try:
             temp_path = f"/tmp/v_{video_id}.mp4"
@@ -196,7 +254,6 @@ def render():
             logger.error(f"Failed to download video: {str(e)}")
             return jsonify({"error": f"Download failed: {str(e)}"}), 502
 
-        # Save to local storage
         try:
             filename = save_video_locally(temp_path, video_id)
         except Exception as e:
@@ -220,7 +277,6 @@ def render():
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         return jsonify({"error": f"Internal error: {str(e)}"}), 500
     finally:
-        # Always cleanup temp files
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -228,11 +284,101 @@ def render():
             except Exception as cleanup_error:
                 logger.warning(f"Failed to cleanup temporary file: {cleanup_error}")
 
+@app.route("/render-sequence", methods=["POST"])
+def render_sequence():
+    """Generate multiple videos sequentially with rate limit protection."""
+    start_time = time.time()
+    
+    try:
+        data = request.json
+        if not data:
+            logger.warning("No JSON data provided in request")
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        prompts = data.get("prompts", [])
+        if not prompts or not isinstance(prompts, list):
+            logger.warning("Missing or invalid prompts list")
+            return jsonify({"error": "Missing or invalid prompts list"}), 400
+        
+        if len(prompts) == 0:
+            return jsonify({"error": "Prompts list is empty"}), 400
+        
+        prompts = [p.strip() for p in prompts if isinstance(p, str) and p.strip()]
+        if not prompts:
+            return jsonify({"error": "All prompts are empty"}), 400
+        
+        aspect_ratio = data.get("aspectRatio", "9:16")
+        valid_aspect_ratios = {"9:16", "16:9", "1:1"}
+        if aspect_ratio not in valid_aspect_ratios:
+            logger.warning(f"Invalid aspectRatio '{aspect_ratio}', defaulting to '9:16'")
+            aspect_ratio = "9:16"
+        
+        logger.info(f"Starting sequential generation of {len(prompts)} videos...")
+        
+        results = []
+        successful = 0
+        failed = 0
+        
+        for i, prompt in enumerate(prompts):
+            logger.info(f"Processing video {i+1}/{len(prompts)}: {prompt[:50]}...")
+            
+            try:
+                filename = generate_single_video(prompt, aspect_ratio)
+                
+                if filename:
+                    video_url = f"https://{request.host}/videos/{filename}"
+                    results.append({
+                        "prompt": prompt,
+                        "filename": filename,
+                        "url": video_url
+                    })
+                    successful += 1
+                    logger.info(f"Video {i+1} generated successfully: {filename}")
+                else:
+                    results.append({
+                        "prompt": prompt,
+                        "error": "Video generation failed"
+                    })
+                    failed += 1
+                    logger.warning(f"Video {i+1} generation failed")
+                
+                if i < len(prompts) - 1:
+                    logger.info(f"Waiting {SEQUENCE_DELAY}s before next generation...")
+                    time.sleep(SEQUENCE_DELAY)
+            
+            except Exception as e:
+                logger.error(f"Error processing video {i+1}: {str(e)}")
+                results.append({
+                    "prompt": prompt,
+                    "error": str(e)
+                })
+                failed += 1
+                
+                if i < len(prompts) - 1:
+                    time.sleep(SEQUENCE_DELAY)
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Sequence generation complete: {successful} successful, {failed} failed in {elapsed:.2f}s")
+        
+        return jsonify({
+            "status": "success",
+            "total": len(prompts),
+            "successful": successful,
+            "failed": failed,
+            "duration_seconds": round(elapsed, 2),
+            "videos": results
+        }), 200
+    
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in request: {str(e)}")
+        return jsonify({"error": "Invalid JSON format"}), 400
+    except Exception as e:
+        logger.error(f"Unexpected error in sequence generation: {str(e)}", exc_info=True)
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
 
 @app.route("/videos/<filename>", methods=["GET"])
 def serve_video(filename):
     """Serve a generated video file from local storage"""
-    # Security check: prevent directory traversal
     if ".." in filename or filename.startswith("/"):
         logger.warning(f"Rejected potentially unsafe filename: {filename}")
         return jsonify({"error": "Invalid filename"}), 400
