@@ -2,12 +2,10 @@ import os
 import time
 import json
 import logging
-import datetime
-from flask import Flask, request, jsonify
+import shutil
+from flask import Flask, request, jsonify, send_from_directory
 from google import genai
 from google.genai import types
-from google.cloud import storage
-from google.oauth2 import service_account
 import requests
 
 # Configure logging
@@ -20,34 +18,14 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 MODEL = "veo-3.1-lite-generate-preview"
-BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "wiadrofilmy")
+STORAGE_DIR = '/app/data'
 POLLING_INTERVAL = 10
 MAX_POLLING_ATTEMPTS = 60  # Reduced to 10 minutes (more reasonable for HTTP)
 MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500MB max
 REQUEST_TIMEOUT = 120  # 2 minutes timeout for HTTP requests
 
-# Initialize GCS credentials once at startup
-_gcs_credentials = None
-_storage_client = None
-
-def _initialize_gcs():
-    """Initialize GCS client once"""
-    global _gcs_credentials, _storage_client
-    try:
-        sa_json_string = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-        if not sa_json_string:
-            raise ValueError("Missing GOOGLE_CREDENTIALS_JSON environment variable")
-        
-        sa_info = json.loads(sa_json_string)
-        _gcs_credentials = service_account.Credentials.from_service_account_info(sa_info)
-        _storage_client = storage.Client(
-            credentials=_gcs_credentials, 
-            project=sa_info['project_id']
-        )
-        logger.info("GCS client initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize GCS: {str(e)}")
-        raise
+# Ensure local storage directory exists
+os.makedirs(STORAGE_DIR, exist_ok=True)
 
 # Initialize on startup
 try:
@@ -59,12 +37,6 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize Gemini client: {str(e)}")
     raise
-
-try:
-    _initialize_gcs()
-except Exception as e:
-    logger.error(f"Failed to initialize at startup: {str(e)}")
-    # Continue anyway, error will be caught during request
 
 def download_video_from_uri(video_uri, temp_path):
     """Download video from Google Cloud URI with size validation"""
@@ -101,56 +73,58 @@ def download_video_from_uri(video_uri, temp_path):
         logger.error(f"Unexpected error during download: {str(e)}")
         raise
 
-def upload_to_gcs(temp_path):
-    """Upload video to Google Cloud Storage"""
-    logger.info(f"Starting GCS upload...")
+def save_video_locally(temp_path, video_id):
+    """Save video to local persistent storage"""
+    logger.info(f"Saving video to local storage...")
     start_time = time.time()
-    
+
     try:
-        if not _storage_client:
-            raise ValueError("GCS client not initialized")
-        
-        # Verify file exists and is readable
+        # Verify file exists and is not empty
         if not os.path.exists(temp_path):
             raise FileNotFoundError(f"Temporary file not found: {temp_path}")
-        
+
         file_size = os.path.getsize(temp_path)
         if file_size == 0:
             raise ValueError("Downloaded video file is empty")
-        
-        logger.info(f"Uploading file of size {file_size} bytes...")
-        
-        bucket = _storage_client.bucket(BUCKET_NAME)
-        blob_name = f"final_video_{int(time.time())}.mp4"
-        blob = bucket.blob(blob_name)
-        
-        blob.upload_from_filename(temp_path, content_type="video/mp4")
-        
+
+        logger.info(f"Saving file of size {file_size} bytes...")
+
+        filename = f"veo_render_{video_id}.mp4"
+        dest_path = os.path.join(STORAGE_DIR, filename)
+        shutil.copy2(temp_path, dest_path)
+
         elapsed = time.time() - start_time
-        logger.info(f"GCS upload completed in {elapsed:.2f}s: {blob_name}")
-        
-        return blob
-        
+        logger.info(f"Video saved locally in {elapsed:.2f}s: {filename}")
+
+        return filename
+
     except Exception as e:
-        logger.error(f"Failed to upload to GCS: {str(e)}")
+        logger.error(f"Failed to save video locally: {str(e)}")
         raise
 
-@app.route("/generate", methods=["POST"])
-def generate():
+@app.route("/render", methods=["POST"])
+def render():
     temp_path = None
     start_time = time.time()
-    
+
     try:
         # Validate request data
         data = request.json
         if not data:
             logger.warning("No JSON data provided in request")
             return jsonify({"error": "No JSON data provided"}), 400
-            
+
         prompt = data.get("prompt", "").strip()
         if not prompt:
             logger.warning("Missing or empty prompt in request")
             return jsonify({"error": "Missing or empty prompt"}), 400
+
+        # Handle aspectRatio parameter
+        aspect_ratio = data.get("aspectRatio", "9:16")
+        valid_aspect_ratios = {"9:16", "16:9", "1:1"}
+        if aspect_ratio not in valid_aspect_ratios:
+            logger.warning(f"Invalid aspectRatio '{aspect_ratio}', defaulting to '9:16'")
+            aspect_ratio = "9:16"
 
         logger.info(f"Starting video generation for prompt: {prompt[:50]}...")
 
@@ -160,7 +134,7 @@ def generate():
                 model=MODEL,
                 prompt=prompt,
                 config=types.GenerateVideosConfig(
-                    aspect_ratio="9:16",
+                    aspect_ratio=aspect_ratio,
                     duration_seconds=8,
                     resolution="1080p",
                 ),
@@ -175,13 +149,13 @@ def generate():
         while not operation.done and attempt < MAX_POLLING_ATTEMPTS:
             logger.info(f"Polling video status (attempt {attempt + 1}/{MAX_POLLING_ATTEMPTS})...")
             time.sleep(POLLING_INTERVAL)
-            
+
             try:
                 operation = client.operations.get(operation)
             except Exception as e:
                 logger.error(f"Failed to get operation status: {str(e)}")
                 raise
-            
+
             attempt += 1
 
         if not operation.done:
@@ -195,11 +169,11 @@ def generate():
         except Exception as e:
             logger.error(f"Failed to get operation result: {str(e)}")
             return jsonify({"error": f"Failed to retrieve generation result: {str(e)}"}), 500
-        
+
         if not result:
             logger.error("Operation result is None")
             return jsonify({"error": "No result from video generation"}), 500
-        
+
         if not hasattr(result, 'generated_videos') or not result.generated_videos:
             logger.error("No generated videos in result")
             return jsonify({"error": "No video generated"}), 500
@@ -208,37 +182,29 @@ def generate():
         if not generated_video or not hasattr(generated_video, 'video') or not generated_video.video:
             logger.error("Invalid video object in result")
             return jsonify({"error": "Invalid video object in result"}), 500
-        
+
         if not hasattr(generated_video.video, 'uri') or not generated_video.video.uri:
             logger.error("No URI in generated video")
             return jsonify({"error": "Invalid video URI"}), 500
 
         # Download video
+        video_id = f"{int(time.time())}_{os.urandom(4).hex()}"
         try:
-            temp_path = f"/tmp/v_{int(time.time())}_{os.urandom(4).hex()}.mp4"
+            temp_path = f"/tmp/v_{video_id}.mp4"
             download_video_from_uri(generated_video.video.uri, temp_path)
         except Exception as e:
             logger.error(f"Failed to download video: {str(e)}")
             return jsonify({"error": f"Download failed: {str(e)}"}), 502
 
-        # Upload to GCS
+        # Save to local storage
         try:
-            blob = upload_to_gcs(temp_path)
+            filename = save_video_locally(temp_path, video_id)
         except Exception as e:
-            logger.error(f"Failed to upload to GCS: {str(e)}")
-            return jsonify({"error": f"Upload failed: {str(e)}"}), 502
+            logger.error(f"Failed to save video locally: {str(e)}")
+            return jsonify({"error": f"Storage failed: {str(e)}"}), 502
 
-        # Generate signed URL
-        try:
-            video_url = blob.generate_signed_url(
-                version="v4",
-                expiration=datetime.timedelta(days=7),
-                method="GET"
-            )
-            logger.info(f"Signed URL generated successfully")
-        except Exception as e:
-            logger.error(f"Failed to generate signed URL: {str(e)}")
-            return jsonify({"error": f"Failed to generate URL: {str(e)}"}), 500
+        video_url = f"https://{request.host}/videos/{filename}"
+        logger.info(f"Video URL generated: {video_url}")
 
         elapsed = time.time() - start_time
         logger.info(f"Success! Video generated in {elapsed:.2f}s")
@@ -261,6 +227,24 @@ def generate():
                 logger.info(f"Cleaned up temporary file: {temp_path}")
             except Exception as cleanup_error:
                 logger.warning(f"Failed to cleanup temporary file: {cleanup_error}")
+
+
+@app.route("/videos/<filename>", methods=["GET"])
+def serve_video(filename):
+    """Serve a generated video file from local storage"""
+    # Security check: prevent directory traversal
+    if ".." in filename or filename.startswith("/"):
+        logger.warning(f"Rejected potentially unsafe filename: {filename}")
+        return jsonify({"error": "Invalid filename"}), 400
+
+    try:
+        return send_from_directory(STORAGE_DIR, filename, as_attachment=True, mimetype="video/mp4")
+    except FileNotFoundError:
+        logger.warning(f"Video file not found: {filename}")
+        return jsonify({"error": "Video not found"}), 404
+    except Exception as e:
+        logger.error(f"Error serving video {filename}: {str(e)}")
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
