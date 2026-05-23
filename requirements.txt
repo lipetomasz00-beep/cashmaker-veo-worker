@@ -2,3 +2,6 @@ google-genai>=0.3.0
 flask
 gunicorn
 requests
+
+ffmpeg-python
+python-dotenv
