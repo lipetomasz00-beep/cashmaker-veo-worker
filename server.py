@@ -38,6 +38,15 @@ MAX_OUTPUT_VIDEO_MB = int(os.getenv("MAX_OUTPUT_VIDEO_MB", "120"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 ENABLE_AUTOMATION_RULES = os.getenv("ENABLE_AUTOMATION_RULES", "true").lower() == "true"
 MAX_HASHTAGS = int(os.getenv("MAX_HASHTAGS", "8"))
+ENABLE_DRY_RUN = os.getenv("ENABLE_DRY_RUN", "false").lower() == "true"
+FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
+RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "8"))
+IDEMPOTENCY_TTL_SECONDS = int(os.getenv("IDEMPOTENCY_TTL_SECONDS", "3600"))
+
+RATE_LIMIT_WINDOW = {}
+RATE_LIMIT_LOCK = threading.Lock()
+IDEMPOTENCY_CACHE = {}
+IDEMPOTENCY_LOCK = threading.Lock()
 
 METRICS = {
     "jobs_started": 0,
@@ -75,21 +84,68 @@ def require_api_key():
         return jsonify({"error": "Unauthorized"}), 401
     return None
 
+def _is_retryable_exception(exc):
+    """Retry tylko dla błędów tymczasowych (timeout/429/5xx)."""
+    text = str(exc).lower()
+    non_retryable_markers = [
+        "400", "invalid_argument", "401", "403", "404", "422",
+        "narration must", "missing or empty", "payload too large"
+    ]
+    if any(m in text for m in non_retryable_markers):
+        return False
+    retryable_markers = ["429", "timeout", "timed out", "connection", "503", "502", "500", "rate limit"]
+    return any(m in text for m in retryable_markers)
+
+def enforce_rate_limit(api_key):
+    now = time.time()
+    with RATE_LIMIT_LOCK:
+        bucket = RATE_LIMIT_WINDOW.get(api_key, [])
+        cutoff = now - 3600
+        bucket = [t for t in bucket if t >= cutoff]
+        if len(bucket) >= RATE_LIMIT_PER_HOUR:
+            RATE_LIMIT_WINDOW[api_key] = bucket
+            return False, int(max(1, 3600 - (now - min(bucket))))
+        bucket.append(now)
+        RATE_LIMIT_WINDOW[api_key] = bucket
+    return True, None
+
+def get_idempotency_response(idempotency_key):
+    now = time.time()
+    with IDEMPOTENCY_LOCK:
+        rec = IDEMPOTENCY_CACHE.get(idempotency_key)
+        if not rec:
+            return None
+        if now - rec["created_at"] > IDEMPOTENCY_TTL_SECONDS:
+            IDEMPOTENCY_CACHE.pop(idempotency_key, None)
+            return None
+        return rec
+
+def remember_idempotency(idempotency_key, response_obj):
+    with IDEMPOTENCY_LOCK:
+        IDEMPOTENCY_CACHE[idempotency_key] = {
+            "created_at": time.time(),
+            **response_obj,
+        }
+
 def retry_with_backoff(operation_name, func, max_retries=3, base_delay=2):
     """Retry helper z exponential backoff dla wywołań zewnętrznych API."""
     for attempt in range(max_retries):
         try:
             return func()
         except Exception as exc:
+            retryable = _is_retryable_exception(exc)
             wait_s = base_delay ** attempt
-            if attempt < max_retries - 1:
+            if attempt < max_retries - 1 and retryable:
                 logger.warning(
                     f"⚠️ {operation_name} failed (attempt {attempt+1}/{max_retries}): {exc}. "
                     f"Retry in {wait_s}s..."
                 )
                 time.sleep(wait_s)
             else:
-                logger.error(f"❌ {operation_name} failed after {max_retries} attempts: {exc}")
+                if not retryable:
+                    logger.error(f"❌ {operation_name} non-retryable error: {exc}")
+                else:
+                    logger.error(f"❌ {operation_name} failed after {max_retries} attempts: {exc}")
                 raise
 
 def validate_request_limits(data):
@@ -321,7 +377,7 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
             prompt=prompt,
             config=types.GenerateVideosConfig(
                 aspect_ratio=aspect_ratio,
-                duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "8")))),
+                duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "4" if FREE_TIER_MODE else "8")))),
                 resolution="1080p",
             ),
         )
@@ -768,6 +824,35 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
             hashtags = build_hashtags(topic, custom_narration, MAX_HASHTAGS)
         
         logger.info(f"🚀 START renderowania Job ID: {job_id} | Temat: {topic}")
+
+        if ENABLE_DRY_RUN:
+            logger.info("🧪 DRY_RUN enabled: skipping external providers and returning simulated success")
+            simulated_filename = f"dryrun_{job_id}.mp4"
+            simulated_path = os.path.join(STORAGE_DIR, simulated_filename)
+            with open(simulated_path, "wb") as f:
+                f.write(b"DRY_RUN")
+            video_url = f"https://{host}/videos/{simulated_filename}"
+            save_render_to_db(job_id, topic, 'success', video_url, video_duration=0.0)
+            if webhook_url:
+                send_webhook(webhook_url, {
+                    "event_type": "render.completed",
+                    "job_id": job_id,
+                    "status": "success",
+                    "video_url": video_url,
+                    "topic": topic,
+                    "video_duration": 0.0,
+                    "file_size_mb": 0.0,
+                    "speed_adjustment": 1.0,
+                    "has_subtitles": False,
+                    "has_watermark": False,
+                    "has_endscreen": False,
+                    "hashtags": hashtags,
+                    "source": "cashmaker-veo-worker",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "dry_run": True,
+                })
+            METRICS["jobs_success"] += 1
+            return
         
         # ═══════════════════════════════════════════════════════════════
         # KROK 1: SZABLON MARKETINGOWY
@@ -1048,6 +1133,21 @@ def start_render_sequence():
     if limits_error:
         return limits_error
 
+        # Free-tier rate limit per API key
+    ok, retry_after = enforce_rate_limit(WORKER_API_KEY or "default")
+    if not ok:
+        return jsonify({
+            "error": "Rate limit exceeded for free tier",
+            "limit_per_hour": RATE_LIMIT_PER_HOUR,
+            "retry_after_seconds": retry_after
+        }), 429
+
+    idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+    if idempotency_key:
+        cached = get_idempotency_response(idempotency_key)
+        if cached:
+            return jsonify(cached["body"]), cached["status"]
+
     topic = data.get("topic", "").strip()
     
     if not topic:
@@ -1074,11 +1174,14 @@ def start_render_sequence():
     )
     thread.start()
     
-    return jsonify({
+    response_body = {
         "status": "queued",
         "job_id": job_id,
         "status_url": f"https://{request.host}/tasks/{job_id}"
-    }), 202
+    }
+    if idempotency_key:
+        remember_idempotency(idempotency_key, {"body": response_body, "status": 202})
+    return jsonify(response_body), 202
 
 
 @app.route("/tasks/<task_id>", methods=["GET"])
@@ -1150,7 +1253,7 @@ def index():
         "version": "3.0.0",
         "features": {
             "veo_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE)",
-            "audio_narration": "ElevenLabs (polski głos Bella)",
+            "audio_narration": "ElevenLabs (głos Adam)",
             "subtitles": "Whisper API (automatyczna transkrypcja)",
             "watermark": "raport-finansowy24.pl (dolny róg)",
             "endscreen": "Plansza końcowa (3s)",
