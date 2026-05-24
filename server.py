@@ -322,7 +322,6 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
             config=types.GenerateVideosConfig(
                 aspect_ratio=aspect_ratio,
                 duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "8")))),
-                duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "8")))),
                 resolution="1080p",
             ),
         )
