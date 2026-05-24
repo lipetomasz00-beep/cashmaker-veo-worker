@@ -321,6 +321,7 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
             prompt=prompt,
             config=types.GenerateVideosConfig(
                 aspect_ratio=aspect_ratio,
+                duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "8")))),
                 duration_seconds=5,
                 resolution="1080p",
             ),
@@ -754,7 +755,8 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
     """
     segment_files = []
     audio_files_dict = {}
-    
+    srt_file = None
+
     try:
         client = get_gemini_client()
         topic = raw_data.get("topic", "Finanse osobiste")
