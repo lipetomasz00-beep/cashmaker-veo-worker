@@ -365,7 +365,7 @@ def generate_audio_narration(narration_texts, job_id):
                 f"ElevenLabs generate ({scene_key})",
                 lambda: elevenlabs.generate(
                     text=text,
-                    voice="Bella",
+                    voice="Adam",
                     model="eleven_monolingual_v1",
                     api_key=ELEVENLABS_API_KEY
                 )
