@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cashmaker.local/schemas/webhook-events.schema.json",
+  "title": "cashmaker-veo-worker webhook events",
+  "description": "Standard webhook payloads emitted by cashmaker-veo-worker",
+  "oneOf": [
+    { "$ref": "#/$defs/renderCompleted" },
+    { "$ref": "#/$defs/renderFailed" }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["event_type", "job_id", "status", "source", "timestamp"],
+      "properties": {
+        "event_type": { "type": "string" },
+        "job_id": { "type": "string", "minLength": 1 },
+        "status": { "type": "string" },
+        "source": { "const": "cashmaker-veo-worker" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": true
+    },
+    "renderCompleted": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": [
+            "event_type",
+            "job_id",
+            "status",
+            "video_url",
+            "topic",
+            "video_duration",
+            "file_size_mb",
+            "speed_adjustment",
+            "has_subtitles",
+            "has_watermark",
+            "has_endscreen",
+            "hashtags",
+            "source",
+            "timestamp"
+          ],
+          "properties": {
+            "event_type": { "const": "render.completed" },
+            "status": { "const": "success" },
+            "video_url": { "type": "string", "format": "uri" },
+            "topic": { "type": "string" },
+            "video_duration": { "type": "number", "minimum": 0 },
+            "file_size_mb": { "type": "number", "minimum": 0 },
+            "speed_adjustment": { "type": "number", "minimum": 0 },
+            "has_subtitles": { "type": "boolean" },
+            "has_watermark": { "type": "boolean" },
+            "has_endscreen": { "type": "boolean" },
+            "hashtags": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "items": {
+                "type": "string",
+                "pattern": "^#\\S+$"
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "renderFailed": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["event_type", "job_id", "status", "error", "source", "timestamp"],
+          "properties": {
+            "event_type": { "const": "render.failed" },
+            "status": { "const": "failed" },
+            "error": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": true
+        }
+      ]
+    }
+  }
+}

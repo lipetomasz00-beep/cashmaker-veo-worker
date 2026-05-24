@@ -3,6 +3,8 @@ import time
 import logging
 import json
 import uuid
+import hmac
+import hashlib
 import requests
 import tempfile
 import subprocess
@@ -27,11 +29,244 @@ MODEL = "veo-3.1-lite-generate-preview"
 STORAGE_DIR = os.getenv('STORAGE_DIR', '/app/data')
 DB_PATH = os.path.join(STORAGE_DIR, 'renders.db')
 os.makedirs(STORAGE_DIR, exist_ok=True)
+MAX_CONCURRENT_RENDERS = int(os.getenv("MAX_CONCURRENT_RENDERS", "2"))
+RENDER_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_RENDERS)
+WORKER_API_KEY = os.getenv("WORKER_API_KEY")
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "16384"))
+MAX_NARRATION_CHARS = int(os.getenv("MAX_NARRATION_CHARS", "2000"))
+MAX_OUTPUT_VIDEO_MB = int(os.getenv("MAX_OUTPUT_VIDEO_MB", "120"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+ENABLE_AUTOMATION_RULES = os.getenv("ENABLE_AUTOMATION_RULES", "true").lower() == "true"
+MAX_HASHTAGS = int(os.getenv("MAX_HASHTAGS", "8"))
+ENABLE_DRY_RUN = os.getenv("ENABLE_DRY_RUN", "false").lower() == "true"
+FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
+RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "8"))
+IDEMPOTENCY_TTL_SECONDS = int(os.getenv("IDEMPOTENCY_TTL_SECONDS", "3600"))
+
+RATE_LIMIT_WINDOW = {}
+RATE_LIMIT_LOCK = threading.Lock()
+IDEMPOTENCY_CACHE = {}
+IDEMPOTENCY_LOCK = threading.Lock()
+
+METRICS = {
+    "jobs_started": 0,
+    "jobs_success": 0,
+    "jobs_failed": 0,
+    "webhook_success": 0,
+    "webhook_failed": 0,
+    "last_error": None
+}
 
 # ElevenLabs API
 ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
 if not ELEVENLABS_API_KEY:
     logger.warning("⚠️ ELEVENLABS_API_KEY not set!")
+
+def validate_required_env():
+    """Walidacja wymaganych zmiennych środowiskowych przy starcie."""
+    required = ["GEMINI_API_KEY", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
+    missing = [key for key in required if not os.getenv(key)]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variables: " + ", ".join(sorted(missing))
+        )
+
+def require_api_key():
+    """Wymagaj poprawnego API key w nagłówku Authorization lub X-API-Key."""
+    auth_header = request.headers.get("Authorization", "")
+    token = None
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+    if not token:
+        token = request.headers.get("X-API-Key", "").strip()
+
+    if not token or not WORKER_API_KEY or token != WORKER_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+    return None
+
+def _is_retryable_exception(exc):
+    """Retry tylko dla błędów tymczasowych (timeout/429/5xx)."""
+    text = str(exc).lower()
+    non_retryable_markers = [
+        "400", "invalid_argument", "401", "403", "404", "422",
+        "narration must", "missing or empty", "payload too large"
+    ]
+    if any(m in text for m in non_retryable_markers):
+        return False
+    retryable_markers = ["429", "timeout", "timed out", "connection", "503", "502", "500", "rate limit"]
+    return any(m in text for m in retryable_markers)
+
+def enforce_rate_limit(api_key):
+    now = time.time()
+    with RATE_LIMIT_LOCK:
+        bucket = RATE_LIMIT_WINDOW.get(api_key, [])
+        cutoff = now - 3600
+        bucket = [t for t in bucket if t >= cutoff]
+        if len(bucket) >= RATE_LIMIT_PER_HOUR:
+            RATE_LIMIT_WINDOW[api_key] = bucket
+            return False, int(max(1, 3600 - (now - min(bucket))))
+        bucket.append(now)
+        RATE_LIMIT_WINDOW[api_key] = bucket
+    return True, None
+
+def get_idempotency_response(idempotency_key):
+    now = time.time()
+    with IDEMPOTENCY_LOCK:
+        rec = IDEMPOTENCY_CACHE.get(idempotency_key)
+        if not rec:
+            return None
+        if now - rec["created_at"] > IDEMPOTENCY_TTL_SECONDS:
+            IDEMPOTENCY_CACHE.pop(idempotency_key, None)
+            return None
+        return rec
+
+def remember_idempotency(idempotency_key, response_obj):
+    with IDEMPOTENCY_LOCK:
+        IDEMPOTENCY_CACHE[idempotency_key] = {
+            "created_at": time.time(),
+            **response_obj,
+        }
+
+def retry_with_backoff(operation_name, func, max_retries=3, base_delay=2):
+    """Retry helper z exponential backoff dla wywołań zewnętrznych API."""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as exc:
+            retryable = _is_retryable_exception(exc)
+            wait_s = base_delay ** attempt
+            if attempt < max_retries - 1 and retryable:
+                logger.warning(
+                    f"⚠️ {operation_name} failed (attempt {attempt+1}/{max_retries}): {exc}. "
+                    f"Retry in {wait_s}s..."
+                )
+                time.sleep(wait_s)
+            else:
+                if not retryable:
+                    logger.error(f"❌ {operation_name} non-retryable error: {exc}")
+                else:
+                    logger.error(f"❌ {operation_name} failed after {max_retries} attempts: {exc}")
+                raise
+
+def validate_request_limits(data):
+    """Twarde limity rozmiaru requestu i pól wejściowych."""
+    content_length = request.content_length or 0
+    if content_length > MAX_REQUEST_BYTES:
+        return jsonify({
+            "error": "Payload too large",
+            "max_request_bytes": MAX_REQUEST_BYTES
+        }), 413
+
+    topic = (data.get("topic") or "").strip()
+    if len(topic) > 200:
+        return jsonify({"error": "Topic too long", "max_topic_chars": 200}), 413
+
+    narration = data.get("narration")
+    if narration is not None:
+        if not isinstance(narration, dict):
+            return jsonify({"error": "Narration must be an object"}), 400
+        total_chars = sum(len(str(v)) for v in narration.values())
+        if total_chars > MAX_NARRATION_CHARS:
+            return jsonify({
+                "error": "Narration too large",
+                "max_narration_chars": MAX_NARRATION_CHARS
+            }), 413
+
+    hashtags = data.get("hashtags")
+    if hashtags is not None:
+        if not isinstance(hashtags, list):
+            return jsonify({"error": "Hashtags must be an array"}), 400
+        if len(hashtags) > MAX_HASHTAGS:
+            return jsonify({"error": "Too many hashtags", "max_hashtags": MAX_HASHTAGS}), 413
+        for tag in hashtags:
+            if not isinstance(tag, str):
+                return jsonify({"error": "Each hashtag must be a string"}), 400
+            if not tag.startswith("#"):
+                return jsonify({"error": "Each hashtag must start with #"}), 400
+            if " " in tag:
+                return jsonify({"error": "Hashtags cannot contain spaces"}), 400
+    return None
+
+def build_hashtags(topic, narration_texts=None, max_count=8):
+    """
+    Generuje zestaw hashtagów:
+    - najpierw podstawowe finansowe i brandowe,
+    - potem słowa z topic.
+    """
+    base_tags = [
+        "#finanse",
+        "#oszczedzanie",
+        "#budzetdomowy",
+        "#kontoosobiste",
+        "#porownanieofert",
+        "#raportfinansowy24",
+    ]
+    topic_words = []
+    for token in topic.lower().replace(",", " ").replace(".", " ").split():
+        cleaned = "".join(ch for ch in token if ch.isalnum())
+        if len(cleaned) >= 4:
+            topic_words.append(f"#{cleaned}")
+
+    tags = []
+    for tag in base_tags + topic_words:
+        if tag not in tags:
+            tags.append(tag)
+        if len(tags) >= max_count:
+            break
+    return tags
+
+def send_webhook(webhook_url, payload):
+    """
+    Wysyłka webhooka z opcjonalnym podpisem HMAC.
+    Podpis: X-Webhook-Signature: sha256=<hex_digest>
+    """
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if WEBHOOK_SECRET:
+        signature = hmac.new(
+            WEBHOOK_SECRET.encode("utf-8"),
+            body,
+            hashlib.sha256
+        ).hexdigest()
+        headers["X-Webhook-Signature"] = f"sha256={signature}"
+
+    return requests.post(webhook_url, data=body, headers=headers, timeout=10)
+
+def apply_optimization_rules(raw_data, topic):
+    """
+    Prosta pętla feedbacku:
+    - Jeśli CTR/VTR są słabe, dostosuj CTA, tempo i narrację.
+    Wejście:
+      raw_data["performance"] = {"ctr": 0.01, "vtr": 0.12}
+    """
+    if not ENABLE_AUTOMATION_RULES:
+        return raw_data
+
+    performance = raw_data.get("performance") or {}
+    ctr = float(performance.get("ctr", 0) or 0)
+    vtr = float(performance.get("vtr", 0) or 0)
+    narration = raw_data.get("narration") or {}
+    optimizations = []
+
+    # Rule 1: słaby CTR => mocniejszy hook i CTA
+    if ctr and ctr < 0.012:
+        narration["hook"] = f"Tracisz pieniądze na {topic}. Sprawdź to przed końcem dnia."
+        raw_data["ctaText"] = "Sprawdź ranking teraz: raport-finansowy24.pl"
+        optimizations.append("low_ctr_hook_cta_boost")
+
+    # Rule 2: słaby VTR => krótsza/jaśniejsza narracja + szybsze tempo
+    if vtr and vtr < 0.20:
+        narration["problem"] = "To częsty błąd: wybór konta bez porównania warunków."
+        narration["rozwiązanie"] = "Porównanie ofert zajmuje chwilę i może realnie obniżyć koszty."
+        raw_data["targetDuration"] = 12
+        optimizations.append("low_vtr_shorter_story")
+
+    if narration:
+        raw_data["narration"] = narration
+    if optimizations:
+        raw_data["optimizations_applied"] = optimizations
+
+    return raw_data
 
 # Inicjalizacja bazy danych SQLite
 def init_db():
@@ -135,14 +370,17 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
     """Generuje pojedynczy klip wideo i zwraca lokalną ścieżkę tymczasową"""
     logger.info(f"🎬 Generowanie segmentu: {prompt[:50]}...")
     
-    operation = client.models.generate_videos(
-        model=MODEL,
-        prompt=prompt,
-        config=types.GenerateVideosConfig(
-            aspect_ratio=aspect_ratio,
-            duration_seconds=5,
-            resolution="1080p",
-        ),
+    operation = retry_with_backoff(
+        "Veo generate_videos",
+        lambda: client.models.generate_videos(
+            model=MODEL,
+            prompt=prompt,
+            config=types.GenerateVideosConfig(
+                aspect_ratio=aspect_ratio,
+                duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "4" if FREE_TIER_MODE else "8")))),
+                resolution="1080p",
+            ),
+        )
     )
     
     attempt = 0
@@ -179,11 +417,14 @@ def generate_audio_narration(narration_texts, job_id):
         logger.info(f"🎙️ Generowanie lektora: {scene_key} ({len(text)} znaków)")
         
         try:
-            audio = elevenlabs.generate(
-                text=text,
-                voice="Bella",
-                model="eleven_monolingual_v1",
-                api_key=ELEVENLABS_API_KEY
+            audio = retry_with_backoff(
+                f"ElevenLabs generate ({scene_key})",
+                lambda: elevenlabs.generate(
+                    text=text,
+                    voice="Adam",
+                    model="eleven_monolingual_v1",
+                    api_key=ELEVENLABS_API_KEY
+                )
             )
             
             audio_file = os.path.join(tempfile.gettempdir(), f"narration_{scene_key}_{job_id}.mp3")
@@ -223,11 +464,14 @@ def generate_subtitles_from_audio(audio_file, job_id):
         openai.api_key = os.getenv("OPENAI_API_KEY")
         
         with open(audio_file, "rb") as f:
-            transcript = openai.Audio.transcribe(
-                model="whisper-1",
-                file=f,
-                language="pl",  # Polski
-                response_format="verbose_json"
+            transcript = retry_with_backoff(
+                "Whisper transcribe",
+                lambda: openai.Audio.transcribe(
+                    model="whisper-1",
+                    file=f,
+                    language="pl",  # Polski
+                    response_format="verbose_json"
+                )
             )
         
         # Generowanie SRT z segmentów (timestamps)
@@ -566,15 +810,49 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
     """
     segment_files = []
     audio_files_dict = {}
-    
+    srt_file = None
+
     try:
         client = get_gemini_client()
         topic = raw_data.get("topic", "Finanse osobiste")
+        raw_data = apply_optimization_rules(raw_data, topic)
         aspect_ratio = raw_data.get("aspectRatio", "9:16")
         host = raw_data.get("host", "localhost:5000")
         custom_narration = raw_data.get("narration")
+        hashtags = raw_data.get("hashtags")
+        if not hashtags:
+            hashtags = build_hashtags(topic, custom_narration, MAX_HASHTAGS)
         
         logger.info(f"🚀 START renderowania Job ID: {job_id} | Temat: {topic}")
+
+        if ENABLE_DRY_RUN:
+            logger.info("🧪 DRY_RUN enabled: skipping external providers and returning simulated success")
+            simulated_filename = f"dryrun_{job_id}.mp4"
+            simulated_path = os.path.join(STORAGE_DIR, simulated_filename)
+            with open(simulated_path, "wb") as f:
+                f.write(b"DRY_RUN")
+            video_url = f"https://{host}/videos/{simulated_filename}"
+            save_render_to_db(job_id, topic, 'success', video_url, video_duration=0.0)
+            if webhook_url:
+                send_webhook(webhook_url, {
+                    "event_type": "render.completed",
+                    "job_id": job_id,
+                    "status": "success",
+                    "video_url": video_url,
+                    "topic": topic,
+                    "video_duration": 0.0,
+                    "file_size_mb": 0.0,
+                    "speed_adjustment": 1.0,
+                    "has_subtitles": False,
+                    "has_watermark": False,
+                    "has_endscreen": False,
+                    "hashtags": hashtags,
+                    "source": "cashmaker-veo-worker",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "dry_run": True,
+                })
+            METRICS["jobs_success"] += 1
+            return
         
         # ═══════════════════════════════════════════════════════════════
         # KROK 1: SZABLON MARKETINGOWY
@@ -646,7 +924,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
         # ═══════════════════════════════════════════════════════════════
         logger.info("⏱️ Etap automatycznego dopasowania długości...")
         
-        target_duration = 15
+        target_duration = int(raw_data.get("targetDuration", 15))
         speed = calculate_video_speed(audio_files_dict, target_duration)
         
         if speed != 1.0:
@@ -704,6 +982,10 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
         # ═══════════════════════════════════════════════════════════════
         video_duration = get_video_duration(final_output_path)
         file_size_mb = os.path.getsize(final_output_path) / (1024 * 1024)
+        if file_size_mb > MAX_OUTPUT_VIDEO_MB:
+            raise ValueError(
+                f"Output file too large: {file_size_mb:.1f} MB > {MAX_OUTPUT_VIDEO_MB} MB"
+            )
         
         logger.info(f"✅ SUKCES! Film gotowy: {final_filename}")
         logger.info(f"  ⏱️ Czas trwania: {video_duration:.2f}s")
@@ -726,6 +1008,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
             logger.info(f"🔔 Wysyłanie webhook...")
             try:
                 webhook_payload = {
+                    "event_type": "render.completed",
                     "job_id": job_id,
                     "status": "success",
                     "video_url": video_url,
@@ -736,31 +1019,41 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
                     "has_subtitles": srt_file is not None,
                     "has_watermark": True,
                     "has_endscreen": True,
+                    "hashtags": hashtags,
+                    "source": "cashmaker-veo-worker",
                     "timestamp": datetime.utcnow().isoformat()
                 }
-                response = requests.post(webhook_url, json=webhook_payload, timeout=10)
+                response = send_webhook(webhook_url, webhook_payload)
                 logger.info(f"✅ Webhook wysłany (status: {response.status_code})")
+                METRICS["webhook_success"] += 1
             except requests.RequestException as e:
                 logger.error(f"⚠️ Błąd webhook: {e}")
+                METRICS["webhook_failed"] += 1
+        METRICS["jobs_success"] += 1
                 
     except Exception as e:
         logger.error(f"❌ BŁĄD KRYTYCZNY Job {job_id}: {e}", exc_info=True)
+        METRICS["jobs_failed"] += 1
+        METRICS["last_error"] = str(e)
         save_render_to_db(job_id, raw_data.get("topic", "Unknown"), 'failed', error=str(e))
         
         if webhook_url:
             try:
                 webhook_payload = {
+                    "event_type": "render.failed",
                     "job_id": job_id,
                     "status": "failed",
                     "error": str(e),
+                    "source": "cashmaker-veo-worker",
                     "timestamp": datetime.utcnow().isoformat()
                 }
-                requests.post(webhook_url, json=webhook_payload, timeout=10)
+                send_webhook(webhook_url, webhook_payload)
                 logger.info(f"🔔 Webhook błędu wysłany")
             except Exception as webhook_error:
                 logger.error(f"⚠️ Błąd webhook: {webhook_error}")
                 
     finally:
+        RENDER_SEMAPHORE.release()
         # ═══════════════════════════════════════════════════════════════
         # CLEANUP
         # ═══════════════════════════════════════════════════════════════
@@ -831,7 +1124,30 @@ def start_render_sequence():
         "webhookUrl": "https://example.com/webhook"
     }
     """
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
     data = request.json or {}
+    limits_error = validate_request_limits(data)
+    if limits_error:
+        return limits_error
+
+        # Free-tier rate limit per API key
+    ok, retry_after = enforce_rate_limit(WORKER_API_KEY or "default")
+    if not ok:
+        return jsonify({
+            "error": "Rate limit exceeded for free tier",
+            "limit_per_hour": RATE_LIMIT_PER_HOUR,
+            "retry_after_seconds": retry_after
+        }), 429
+
+    idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+    if idempotency_key:
+        cached = get_idempotency_response(idempotency_key)
+        if cached:
+            return jsonify(cached["body"]), cached["status"]
+
     topic = data.get("topic", "").strip()
     
     if not topic:
@@ -839,6 +1155,13 @@ def start_render_sequence():
     
     webhook_url = data.get("webhookUrl")
     job_id = str(uuid.uuid4())
+    METRICS["jobs_started"] += 1
+
+    if not RENDER_SEMAPHORE.acquire(blocking=False):
+        return jsonify({
+            "error": "Too many concurrent renders",
+            "max_concurrent_renders": MAX_CONCURRENT_RENDERS
+        }), 429
     
     data['host'] = request.host
     save_render_to_db(job_id, topic, 'processing')
@@ -851,16 +1174,23 @@ def start_render_sequence():
     )
     thread.start()
     
-    return jsonify({
+    response_body = {
         "status": "queued",
         "job_id": job_id,
         "status_url": f"https://{request.host}/tasks/{job_id}"
-    }), 202
+    }
+    if idempotency_key:
+        remember_idempotency(idempotency_key, {"body": response_body, "status": 202})
+    return jsonify(response_body), 202
 
 
 @app.route("/tasks/<task_id>", methods=["GET"])
 def get_task_status(task_id):
     """GET /tasks/<job_id>"""
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
     render = get_render_from_db(task_id)
     
     if not render:
@@ -889,6 +1219,9 @@ def get_task_status(task_id):
 @app.route('/videos/<path:filename>')
 def serve_video(filename):
     """GET /videos/<filename>"""
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
     return send_from_directory(STORAGE_DIR, filename)
 
 
@@ -899,8 +1232,17 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "storage_dir": STORAGE_DIR,
-        "elevenlabs": "✅ configured" if ELEVENLABS_API_KEY else "❌ not configured"
+        "elevenlabs": "✅ configured" if ELEVENLABS_API_KEY else "❌ not configured",
+        "metrics": METRICS
     }), 200
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    """GET /metrics - proste metryki runtime."""
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+    return jsonify(METRICS), 200
 
 
 @app.route("/", methods=["GET"])
@@ -911,7 +1253,7 @@ def index():
         "version": "3.0.0",
         "features": {
             "veo_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE)",
-            "audio_narration": "ElevenLabs (polski głos Bella)",
+            "audio_narration": "ElevenLabs (głos Adam)",
             "subtitles": "Whisper API (automatyczna transkrypcja)",
             "watermark": "raport-finansowy24.pl (dolny róg)",
             "endscreen": "Plansza końcowa (3s)",
@@ -927,6 +1269,7 @@ def index():
 
 
 if __name__ == "__main__":
+    validate_required_env()
     logger.info("🚀 Startup VeoVideo API v3.0 (Napisy + Watermark + Plansza)")
     logger.info(f"📁 Storage: {STORAGE_DIR}")
     logger.info(f"🗄️  Database: {DB_PATH}")
