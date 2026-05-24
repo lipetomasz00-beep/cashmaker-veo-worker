@@ -322,7 +322,7 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
             config=types.GenerateVideosConfig(
                 aspect_ratio=aspect_ratio,
                 duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "8")))),
-                duration_seconds=5,
+                duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "8")))),
                 resolution="1080p",
             ),
         )
@@ -366,7 +366,7 @@ def generate_audio_narration(narration_texts, job_id):
                 f"ElevenLabs generate ({scene_key})",
                 lambda: elevenlabs.generate(
                     text=text,
-                    voice="Bella",
+                    voice="Adam",
                     model="eleven_monolingual_v1",
                     api_key=ELEVENLABS_API_KEY
                 )
