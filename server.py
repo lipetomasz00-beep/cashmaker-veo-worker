@@ -7,6 +7,7 @@ import hmac
 import hashlib
 import requests
 import tempfile
+import sys
 import subprocess
 import threading
 import sqlite3
@@ -20,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 # ---------------------------------------------------------------------------
 # KONFIGURACJA I INICJALIZACJA
 # ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
