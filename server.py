@@ -434,11 +434,11 @@ def generate_audio_narration(narration_texts, job_id):
         try:
             # Nowe ElevenLabs zwraca strumień danych (generator), a nie gotowy plik
             audio_stream = retry_with_backoff(
-                f"ElevenLabs generate ({scene_key})",
-                lambda: client.generate(
+                f"ElevenLabs text_to_speech ({scene_key})",
+                lambda: client.text_to_speech.convert(
                     text=text,
-                    voice="Adam",
-                    model="eleven_monolingual_v1"
+                    voice_id="pNInz6obpgDQGcFmaJgB",  # Adam voice ID
+                    model_id="eleven_monolingual_v1"
                 )
             )
             
