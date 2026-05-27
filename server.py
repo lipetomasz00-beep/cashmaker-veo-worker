@@ -434,11 +434,11 @@ def generate_audio_narration(narration_texts, job_id):
         try:
             # Nowe ElevenLabs zwraca strumień danych (generator), a nie gotowy plik
             audio_stream = retry_with_backoff(
-                f"ElevenLabs generate ({scene_key})",
-                lambda: client.generate(
+                f"ElevenLabs text_to_speech ({scene_key})",
+                lambda: client.text_to_speech.convert(
                     text=text,
-                    voice="Adam",
-                    model="eleven_monolingual_v1"
+                    voice_id="pNInz6obpgDQGcFmaJgB",  # Adam voice ID
+                    model_id="eleven_monolingual_v1"
                 )
             )
             
@@ -1048,6 +1048,26 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
             except requests.RequestException as e:
                 logger.error(f"⚠️ Błąd webhook: {e}")
                 METRICS["webhook_failed"] += 1
+
+        # Upload to S3 bucket if configured
+        try:
+            if os.getenv("AWS_S3_BUCKET_NAME"):
+                import boto3
+                s3 = boto3.client(
+                    's3',
+                    endpoint_url=os.getenv('AWS_ENDPOINT_URL'),
+                    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+                    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+                    region_name=os.getenv('AWS_DEFAULT_REGION')
+                )
+                bucket_name = os.getenv('AWS_S3_BUCKET_NAME')
+                s3_key = f"videos/{job_id}/{final_filename}"
+                logger.info(f"📤 Uploading to S3: s3://{bucket_name}/{s3_key}")
+                s3.upload_file(final_output_path, bucket_name, s3_key)
+                logger.info(f"✅ S3 upload complete")
+        except Exception as e:
+            logger.warning(f"⚠️ S3 upload failed (non-critical): {e}")
+
         METRICS["jobs_success"] += 1
                 
     except Exception as e:
