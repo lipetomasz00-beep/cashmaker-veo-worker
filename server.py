@@ -1128,6 +1128,27 @@ def cleanup_old_files(hours=24):
         logger.info(f"✅ Cleanup: Usunięto {cleaned_count} starych plików")
 
 # ---------------------------------------------------------------------------
+# BACKGROUND CLEANUP THREAD
+# ---------------------------------------------------------------------------
+
+def start_cleanup_thread():
+    """Start background cleanup thread for old files"""
+    def cleanup_loop():
+        while True:
+            try:
+                time.sleep(24 * 3600)  # Run every 24 hours
+                cleanup_old_files(hours=24)
+            except Exception as e:
+                logger.error(f"❌ Cleanup thread error: {e}")
+    
+    thread = threading.Thread(target=cleanup_loop, daemon=True)
+    thread.start()
+    logger.info("✅ Background cleanup thread started")
+
+# Start cleanup thread on app startup
+start_cleanup_thread()
+
+# ---------------------------------------------------------------------------
 # ENDPOINTY FLASK
 # ---------------------------------------------------------------------------
 
