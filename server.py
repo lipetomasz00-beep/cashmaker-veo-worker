@@ -830,6 +830,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
     segment_files = []
     audio_files_dict = {}
     srt_file = None
+    render_success = False  # Track success for this specific job
 
     try:
         client = get_gemini_client()
@@ -1048,6 +1049,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
             except requests.RequestException as e:
                 logger.error(f"⚠️ Błąd webhook: {e}")
                 METRICS["webhook_failed"] += 1
+        render_success = True  # Mark as success before incrementing metrics
         METRICS["jobs_success"] += 1
                 
     except Exception as e:
@@ -1073,30 +1075,33 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
                 
     finally:
         RENDER_SEMAPHORE.release()
-        # ═══════════════════════════════════════════════════════════════
-        # CLEANUP
-        # ═══════════════════════════════════════════════════════════════
-        logger.info("🧹 Czyszczenie plików tymczasowych...")
-        for path in segment_files:
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception as e:
-                    logger.warning(f"⚠️ Nie udało się usunąć {path}: {e}")
         
-        for scene_key, audio_info in audio_files_dict.items():
-            audio_path = audio_info.get("path")
-            if audio_path and os.path.exists(audio_path):
+        # Only cleanup temp files on SUCCESS
+        # On error, keep them for retry (cleanup_old_files will remove after 24h)
+        if render_success:
+            logger.info("🧹 Czyszczenie plików tymczasowych (SUKCES)...")
+            for path in segment_files:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Nie udało się usunąć {path}: {e}")
+            
+            for scene_key, audio_info in audio_files_dict.items():
+                audio_path = audio_info.get("path")
+                if audio_path and os.path.exists(audio_path):
+                    try:
+                        os.remove(audio_path)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Nie udało się usunąć {audio_path}: {e}")
+            
+            if srt_file and os.path.exists(srt_file):
                 try:
-                    os.remove(audio_path)
-                except Exception as e:
-                    logger.warning(f"⚠️ Nie udało się usunąć {audio_path}: {e}")
-        
-        if srt_file and os.path.exists(srt_file):
-            try:
-                os.remove(srt_file)
-            except:
-                pass
+                    os.remove(srt_file)
+                except:
+                    pass
+        else:
+            logger.info(f"⏳ Błąd Job {job_id} - temp files czekają na retry (usunięte po 24h)")
 
 # ---------------------------------------------------------------------------
 # CLEANUP STARYCH PLIKÓW
