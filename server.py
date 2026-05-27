@@ -17,6 +17,7 @@ from google import genai
 from google.genai import types
 import elevenlabs
 from PIL import Image, ImageDraw, ImageFont
+from elevenlabs.client import ElevenLabs
 
 # ---------------------------------------------------------------------------
 # KONFIGURACJA I INICJALIZACJA
@@ -409,17 +410,18 @@ def generate_audio_narration(narration_texts, job_id):
     if not ELEVENLABS_API_KEY:
         logger.error("❌ ElevenLabs API key not configured!")
         raise ValueError("ELEVENLABS_API_KEY not set")
-    
-    elevenlabs.set_api_key(ELEVENLABS_API_KEY)
+
+    # Inicjalizacja klienta raz, przed pętlą
+    client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
     audio_files = {}
-    
+
     for scene_key, text in narration_texts.items():
         # Ustal ścieżkę pliku
         audio_file = os.path.join(tempfile.gettempdir(), f"narration_{scene_key}_{job_id}.mp3")
-        
+
         # --- CHECKPOINT: Jeśli plik istnieje, nie wołaj API ---
         if os.path.exists(audio_file):
-            logger.info(f"⏭️ Lektor {scene_key} już istnieje. Pomijam ElevenLabs.")
+            logger.info(f"⏩ Lektor {scene_key} już istnieje. Pomijam ElevenLabs.")
             duration = get_audio_duration(audio_file)
             audio_files[scene_key] = {
                 "path": audio_file,
@@ -427,39 +429,43 @@ def generate_audio_narration(narration_texts, job_id):
                 "text": text
             }
             continue # Przejdź do następnej sceny
-        # -----------------------------------------------------
-        
+
         logger.info(f"🎙️ Generowanie lektora: {scene_key} ({len(text)} znaków)")
-        
+
         try:
-            audio = retry_with_backoff(
+            # Nowe ElevenLabs zwraca strumień danych (generator), a nie gotowy plik
+            audio_stream = retry_with_backoff(
                 f"ElevenLabs generate ({scene_key})",
-                lambda: elevenlabs.generate(
+                lambda: client.generate(
                     text=text,
                     voice="Adam",
-                    model="eleven_monolingual_v1",
-                    api_key=ELEVENLABS_API_KEY
+                    model="eleven_monolingual_v1"
                 )
             )
             
+            # Bezpieczny zapis strumienia w kawałkach (chunkach) do pliku MP3
             with open(audio_file, "wb") as f:
-                f.write(audio)
+                for chunk in audio_stream:
+                    if chunk:
+                        f.write(chunk)
             
+            logger.info(f"✅ Lektor dla {scene_key} zapisany pomyślnie.")
             duration = get_audio_duration(audio_file)
-            logger.info(f"✅ Lektor {scene_key}: {duration:.2f}s")
             
+            # Dodanie informacji o zapisanym pliku do słownika
             audio_files[scene_key] = {
                 "path": audio_file,
                 "duration": duration,
                 "text": text
             }
-            
-        except Exception as e:
-            logger.error(f"❌ Błąd generowania lektora {scene_key}: {e}")
-            raise e
-    
-    return audio_files
 
+        except Exception as e:
+            logger.error(f"❌ Błąd generowania lektora dla {scene_key}: {e}")
+            # Rzucamy błąd dalej - jeśli lektor padł, nie ma sensu renderować wideo bez dźwięku
+            raise 
+
+    # TEN RETURN JEST KLUCZOWY - oddaje dane do dalszego montażu
+    return audio_files
 # ---------------------------------------------------------------------------
 # NAPISY: GENEROWANIE SRT Z AUDIO (Whisper API)
 # ---------------------------------------------------------------------------
