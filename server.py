@@ -15,7 +15,6 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_from_directory
 from google import genai
 from google.genai import types
-import elevenlabs
 from PIL import Image, ImageDraw, ImageFont
 from elevenlabs.client import ElevenLabs
 
