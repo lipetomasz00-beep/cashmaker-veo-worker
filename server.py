@@ -405,16 +405,30 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
 # ---------------------------------------------------------------------------
 
 def generate_audio_narration(narration_texts, job_id):
-    """Generowanie MP3 z lektorem dla każdej sceny"""
+    """Generowanie MP3 z lektorem dla każdej sceny z systemem checkpointów"""
     if not ELEVENLABS_API_KEY:
         logger.error("❌ ElevenLabs API key not configured!")
         raise ValueError("ELEVENLABS_API_KEY not set")
     
     elevenlabs.set_api_key(ELEVENLABS_API_KEY)
-    
     audio_files = {}
     
     for scene_key, text in narration_texts.items():
+        # Ustal ścieżkę pliku
+        audio_file = os.path.join(tempfile.gettempdir(), f"narration_{scene_key}_{job_id}.mp3")
+        
+        # --- CHECKPOINT: Jeśli plik istnieje, nie wołaj API ---
+        if os.path.exists(audio_file):
+            logger.info(f"⏭️ Lektor {scene_key} już istnieje. Pomijam ElevenLabs.")
+            duration = get_audio_duration(audio_file)
+            audio_files[scene_key] = {
+                "path": audio_file,
+                "duration": duration,
+                "text": text
+            }
+            continue # Przejdź do następnej sceny
+        # -----------------------------------------------------
+        
         logger.info(f"🎙️ Generowanie lektora: {scene_key} ({len(text)} znaków)")
         
         try:
@@ -428,7 +442,6 @@ def generate_audio_narration(narration_texts, job_id):
                 )
             )
             
-            audio_file = os.path.join(tempfile.gettempdir(), f"narration_{scene_key}_{job_id}.mp3")
             with open(audio_file, "wb") as f:
                 f.write(audio)
             
