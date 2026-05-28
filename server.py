@@ -367,38 +367,96 @@ def download_video_with_backoff(video_uri, temp_path, max_retries=5):
 # GENEROWANIE SEGMENTÓW WIDEO
 # ---------------------------------------------------------------------------
 
-def generate_video_segment(client, prompt, aspect_ratio="9:16"):
-    """Generuje pojedynczy klip wideo i zwraca lokalną ścieżkę tymczasową"""
+def generate_video_segment(client, prompt, aspect_ratio="9:16", max_retries=3):
+    """Generuje pojedynczy klip wideo z retry logic dla pustych odpowiedzi"""
     logger.info(f"🎬 Generowanie segmentu: {prompt[:50]}...")
     
-    operation = retry_with_backoff(
-        "Veo generate_videos",
-        lambda: client.models.generate_videos(
-            model=MODEL,
-            prompt=prompt,
-            config=types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio,
-                duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "4" if FREE_TIER_MODE else "8")))),
-                resolution="1080p",
-            ),
-        )
-    )
-    
-    attempt = 0
-    while not operation.done and attempt < 60:
-        time.sleep(10)
-        operation = client.operations.get(operation)
-        attempt += 1
-        
-    if not operation.done:
-        raise TimeoutError("❌ Veo API timeout podczas generowania segmentu.")
-        
-    result = operation.result
-    video_uri = result.generated_videos[0].video.uri
-    
-    temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
-    download_video_with_backoff(video_uri, temp_file)
-    return temp_file
+    for attempt in range(max_retries):
+        try:
+            # Inicjuj operację generowania
+            operation = retry_with_backoff(
+                "Veo generate_videos",
+                lambda: client.models.generate_videos(
+                    model=MODEL,
+                    prompt=prompt,
+                    config=types.GenerateVideosConfig(
+                        aspect_ratio=aspect_ratio,
+                        duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "4" if FREE_TIER_MODE else "8")))),
+                        resolution="1080p",
+                    ),
+                )
+            )
+            
+            # Czekaj na ukończenie operacji
+            poll_attempt = 0
+            while not operation.done and poll_attempt < 60:
+                time.sleep(10)
+                operation = client.operations.get(operation)
+                poll_attempt += 1
+                
+            if not operation.done:
+                raise TimeoutError("❌ Veo API timeout podczas generowania segmentu.")
+                
+            result = operation.result
+
+            # Guard clause: validate API response structure
+            if not result or not getattr(result, 'generated_videos', None):
+                logger.warning(f"⚠️ Veo zwrócił pustą odpowiedź (próba {attempt+1}/{max_retries}). Retry za {2**attempt}s...")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                    continue
+                else:
+                    logger.error(f"❌ Veo API zwrócił pustą odpowiedź po {max_retries} próbach")
+                    raise ValueError(
+                        "Veo API nie zwrócił wygenerowanego wideo po wielu próbach. "
+                        "Możliwe przyczyny: safety filter, błąd modelu, lub problemy z API."
+                    )
+
+            if not result.generated_videos or len(result.generated_videos) == 0:
+                logger.warning(f"⚠️ Veo zwrócił pustą listę (próba {attempt+1}/{max_retries}). Retry za {2**attempt}s...")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    logger.error(f"❌ Veo API zwrócił pustą listę po {max_retries} próbach")
+                    raise ValueError("Veo API zwrócił pustą listę wideo po wielu próbach")
+
+            # Safe access to first video
+            first_video = result.generated_videos[0]
+            if not first_video or not getattr(first_video, 'video', None):
+                logger.warning(f"⚠️ Struktura niekompletna (próba {attempt+1}/{max_retries}). Retry za {2**attempt}s...")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    logger.error(f"❌ Struktura odpowiedzi Veo API niekompletna po {max_retries} próbach")
+                    raise ValueError("Struktura odpowiedzi Veo API jest niekompletna po wielu próbach")
+
+            video_uri = first_video.video.uri
+
+            if not video_uri:
+                logger.warning(f"⚠️ Brak URI (próba {attempt+1}/{max_retries}). Retry za {2**attempt}s...")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    logger.error(f"❌ Veo API zwrócił video bez URI po {max_retries} próbach")
+                    raise ValueError("Veo API zwrócił video bez URI po wielu próbach")
+
+            # ✅ SUCCESS - pobierz wideo
+            temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
+            download_video_with_backoff(video_uri, temp_file)
+            logger.info(f"✅ Segment wygenerowany (próba {attempt+1})")
+            return temp_file
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"⚠️ Błąd generowania (próba {attempt+1}/{max_retries}): {e}. Retry za {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"❌ Nie udało się wygenerować segmentu po {max_retries} próbach: {e}")
+                raise
 
 # ---------------------------------------------------------------------------
 # AUDIO: LEKTOR (ElevenLabs)
