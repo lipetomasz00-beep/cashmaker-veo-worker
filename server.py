@@ -472,8 +472,11 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
         
     if not operation.done:
         raise TimeoutError("❌ Veo API timeout podczas generowania segmentu.")
-        
+
     result = operation.result
+    if not result or not hasattr(result, 'generated_videos') or not result.generated_videos:
+        raise ValueError(f"❌ Veo API returned invalid response: {result}")
+
     video_uri = result.generated_videos[0].video.uri
     
     temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
