@@ -385,7 +385,7 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
     )
     
     attempt = 0
-    while not operation.done and attempt < 60:
+    while not operation.done and attempt < 12:
         time.sleep(10)
         operation = client.operations.get(operation)
         attempt += 1
