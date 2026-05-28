@@ -433,14 +433,33 @@ def generate_audio_narration(narration_texts, job_id):
 
         try:
             # Nowe ElevenLabs zwraca strumień danych (generator), a nie gotowy plik
-            audio_stream = retry_with_backoff(
-                f"ElevenLabs text_to_speech ({scene_key})",
-                lambda: client.text_to_speech.convert(
-                    text=text,
-                    voice_id="pNInz6obpgDQGcFmaJgB",
-                    model_id="eleven_multilingual_v2"
+            # Try new API first, fallback to helper function
+            audio_stream = None
+            try:
+                logger.info(f"🎙️ Trying text_to_speech.convert()...")
+                audio_stream = retry_with_backoff(
+                    f"ElevenLabs text_to_speech.convert ({scene_key})",
+                    lambda: client.text_to_speech.convert(
+                        text=text,
+                        voice_id="pNInz6obpgDQGcFmaJgB",
+                        model_id="eleven_multilingual_v2"
+                    )
                 )
-            )
+            except Exception as e1:
+                logger.warning(f"⚠️ text_to_speech.convert() failed: {e1}. Trying generate()...")
+                try:
+                    audio_stream = retry_with_backoff(
+                        f"ElevenLabs generate ({scene_key})",
+                        lambda: client.generate(
+                            text=text,
+                            voice="Adam",
+                            model="eleven_multilingual_v2"
+                        )
+                    )
+                    logger.info(f"✅ Fallback to generate() worked!")
+                except Exception as e2:
+                    logger.error(f"❌ Both methods failed: convert={e1}, generate={e2}")
+                    raise e2
             
             # Bezpieczny zapis strumienia w kawałkach (chunkach) do pliku MP3
             with open(audio_file, "wb") as f:
