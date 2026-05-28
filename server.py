@@ -386,7 +386,9 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
     
     attempt = 0
     while not operation.done and attempt < 60:
-        time.sleep(10)
+        wait_time = min(10 * (2 ** attempt), 120)  # Exponential: 10s, 20s, 40s, 80s, 120s
+        logger.info(f"⏳ Veo API polling attempt {attempt+1}/60, waiting {wait_time}s...")
+        time.sleep(wait_time)
         operation = client.operations.get(operation)
         attempt += 1
         
