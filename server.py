@@ -394,8 +394,31 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
         raise TimeoutError("❌ Veo API timeout podczas generowania segmentu.")
         
     result = operation.result
-    video_uri = result.generated_videos[0].video.uri
-    
+
+    # Guard clause: validate API response structure
+    if not result or not getattr(result, 'generated_videos', None):
+        logger.error(f"❌ Veo API zwrócił pustą odpowiedź. Result: {result}")
+        raise ValueError(
+            "Veo API nie zwrócił wygenerowanego wideo. "
+            "Możliwe przyczyny: safety filter, błąd modelu, lub operacja niekompletna."
+        )
+
+    if not result.generated_videos or len(result.generated_videos) == 0:
+        logger.error(f"❌ Veo API zwrócił pustą listę generated_videos")
+        raise ValueError("Veo API zwrócił pustą listę wideo")
+
+    # Safe access to first video
+    first_video = result.generated_videos[0]
+    if not first_video or not getattr(first_video, 'video', None):
+        logger.error(f"❌ Pierwszy element generated_videos nie zawiera pola 'video'")
+        raise ValueError("Struktura odpowiedzi Veo API jest niekompletna")
+
+    video_uri = first_video.video.uri
+
+    if not video_uri:
+        logger.error(f"❌ Veo API zwrócił video bez URI")
+        raise ValueError("Veo API zwrócił video bez URI")
+
     temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
     download_video_with_backoff(video_uri, temp_file)
     return temp_file
