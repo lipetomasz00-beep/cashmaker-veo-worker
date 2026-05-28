@@ -819,6 +819,77 @@ NARRATION_TEMPLATES = {
     "rozwiązanie": "Regularne porównywanie ofert pozwala znaleźć korzystniejsze opcje i zaoszczędzić na rachunkach."
 }
 
+def upload_video_to_s3(local_video_path, job_id):
+    """
+    Upload wygenerowanego wideo do S3 bucket
+    
+    Returns: S3 URL lub None jeśli upload się nie powiódł
+    """
+    try:
+        import boto3
+        
+        bucket_name = os.getenv('AWS_S3_BUCKET_NAME')
+        endpoint_url = os.getenv('AWS_ENDPOINT_URL')
+        access_key = os.getenv('AWS_ACCESS_KEY_ID')
+        secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+        region = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
+        
+        # Walidacja konfiguracji
+        if not all([bucket_name, access_key, secret_key]):
+            logger.warning("⚠️ S3 configuration incomplete. Skipping S3 upload.")
+            return None
+        
+        # Inicjalizacja S3 client
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=endpoint_url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region
+        )
+        
+        # S3 key (ścieżka w bucket)
+        s3_key = f"videos/{job_id}.mp4"
+        
+        logger.info(f"📤 Uploadowanie do S3: s3://{bucket_name}/{s3_key}")
+        
+        # Upload z retry
+        for attempt in range(3):
+            try:
+                s3_client.upload_file(
+                    local_video_path,
+                    bucket_name,
+                    s3_key,
+                    ExtraArgs={'ContentType': 'video/mp4'}
+                )
+                
+                # Generowanie S3 URL
+                if endpoint_url:
+                    # Custom S3 endpoint (Railway bucket)
+                    s3_url = f"{endpoint_url}/{bucket_name}/{s3_key}"
+                else:
+                    # AWS S3
+                    s3_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_key}"
+                
+                logger.info(f"✅ S3 upload SUCCESS: {s3_url}")
+                return s3_url
+                
+            except Exception as e:
+                if attempt < 2:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"⚠️ S3 upload failed (attempt {attempt+1}/3): {e}. Retry in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"❌ S3 upload failed after 3 attempts: {e}")
+                    return None
+    
+    except ImportError:
+        logger.warning("⚠️ boto3 not installed. Skipping S3 upload.")
+        return None
+    except Exception as e:
+        logger.error(f"❌ S3 upload error: {e}")
+        return None
+
 def render_sequence_background(job_id, raw_data, webhook_url=None):
     """
     Główny proces montażu sekwencji - uruchamiany w tle
@@ -1013,6 +1084,14 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
         
         video_url = f"https://{host}/videos/{final_filename}"
         logger.info(f"📺 URL: {video_url}")
+        
+        # Try to upload to S3 (if configured)
+        s3_url = upload_video_to_s3(final_output_path, job_id)
+        if s3_url:
+            video_url = s3_url  # Use S3 URL as primary
+            logger.info(f"📦 S3 URL set as primary: {s3_url}")
+        else:
+            logger.info(f"📦 Using local HTTP URL: {video_url}")
         
         # ═══════════════════════════════════════════════════════════════
         # KROK 9: AKTUALIZACJA BAZY DANYCH
