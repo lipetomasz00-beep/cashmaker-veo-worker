@@ -26,6 +26,11 @@ def concatenate_videos(video_paths, output_path):
         output_path
     ]
 
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found. Install it with: apt-get install ffmpeg")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg failed: {e.stderr}")
 
     return output_path
