@@ -601,8 +601,7 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
     while not operation.done and attempt < 60:
         wait_time = min(10 * (2 ** attempt), 120)  # Exponential: 10s, 20s, 40s, 80s, 120s
         if total_wait_time + wait_time > MAX_TOTAL_WAIT_SECONDS:
-            logger.error(f"❌ Veo API polling exceeded {MAX_TOTAL_WAIT_SECONDS}s total wait time")
-            break
+            raise TimeoutError(f"❌ Veo API timeout after {total_wait_time}s and {attempt} attempts")
         logger.info(f"⏳ Veo API polling attempt {attempt+1}/60, waiting {wait_time}s (total: {total_wait_time}s)...")
         time.sleep(wait_time)
         operation = client.operations.get(operation)
