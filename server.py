@@ -49,6 +49,34 @@ RATE_LIMIT_LOCK = threading.Lock()
 IDEMPOTENCY_CACHE = {}
 IDEMPOTENCY_LOCK = threading.Lock()
 
+# API response cache to minimize costs
+API_CACHE = {}
+API_CACHE_TTL_SECONDS = 3600  # 1 hour
+
+def cache_api_response(cache_key, response_data):
+    """Cache an API response with TTL."""
+    API_CACHE[cache_key] = {
+        "data": response_data,
+        "cached_at": datetime.utcnow(),
+        "ttl": API_CACHE_TTL_SECONDS
+    }
+    logger.info(f"💾 Cached API response: {cache_key}")
+
+def get_cached_api_response(cache_key):
+    """Get cached API response if still valid."""
+    if cache_key not in API_CACHE:
+        return None
+
+    cached = API_CACHE[cache_key]
+    age = (datetime.utcnow() - cached["cached_at"]).total_seconds()
+
+    if age > cached["ttl"]:
+        del API_CACHE[cache_key]
+        return None
+
+    logger.info(f"✅ Using cached API response: {cache_key} (age: {age:.0f}s)")
+    return cached["data"]
+
 METRICS = {
     "jobs_started": 0,
     "jobs_success": 0,
@@ -310,6 +338,60 @@ def get_gemini_client():
         api_key=os.getenv("GEMINI_API_KEY")
     )
 
+def call_gemini_with_cache(prompt, cache_key_prefix, max_retries=2):
+    """Call Gemini API with caching to minimize costs."""
+    cache_key = f"gemini:{cache_key_prefix}:{hash(prompt) % 10000}"
+
+    # Check cache first
+    cached = get_cached_api_response(cache_key)
+    if cached:
+        return cached
+
+    # Call API
+    client = get_gemini_client()
+    for attempt in range(max_retries):
+        try:
+            response = client.generate_content(prompt)
+            result = response.text
+
+            # Cache the result
+            cache_api_response(cache_key, result)
+            return result
+
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            logger.warning(f"⚠️  Gemini API attempt {attempt + 1} failed: {e}")
+            time.sleep(2 ** attempt)  # exponential backoff
+
+    raise RuntimeError("Gemini API failed after retries")
+
+def call_elevenlabs_with_cache(text, voice_id, cache_key_prefix, max_retries=2):
+    """Call ElevenLabs API with caching to minimize costs."""
+    cache_key = f"elevenlabs:{cache_key_prefix}:{hash(text) % 10000}"
+
+    # Check cache first
+    cached = get_cached_api_response(cache_key)
+    if cached:
+        return cached
+
+    # Call API
+    for attempt in range(max_retries):
+        try:
+            audio_data = generate_audio_with_elevenlabs(text, voice_id)
+
+            # Cache the result
+            cache_api_response(cache_key, audio_data)
+            return audio_data
+
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            logger.warning(f"⚠️  ElevenLabs API attempt {attempt + 1} failed: {e}")
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError("ElevenLabs API failed after retries")
+
 # ---------------------------------------------------------------------------
 # HISTORIA RENDERÓW (SQLite)
 # ---------------------------------------------------------------------------
@@ -333,18 +415,16 @@ def save_render_to_db(job_id, topic, status, video_url=None, error=None, video_d
     conn.close()
 
 def save_checkpoint(job_id, stage, data=None, error=None):
-    """Save a checkpoint so the job can be resumed from this stage on error.
-
-    When called with error=None (mid-job progress marker) the job status stays
-    'processing'.  When called with an error string the status is set to
-    'paused' so the resume endpoint can pick it up.
-    """
+    """Save a checkpoint so the job can be resumed from this stage on error."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     checkpoint_json = json.dumps(data or {})
-    now = datetime.utcnow()
+
     if error is not None:
-        # Job hit an error – pause it
+        # Job hit an error – pause it and wait for manual resume
+        logger.warning(f"⏸️  Job {job_id} paused at stage '{stage}': {error}")
+        logger.info(f"📋 To resume: POST /resume/{job_id}")
+
         c.execute('''UPDATE renders
                      SET current_stage   = ?,
                          checkpoint_data = ?,
@@ -352,14 +432,15 @@ def save_checkpoint(job_id, stage, data=None, error=None):
                          paused_reason   = ?,
                          status          = 'paused'
                      WHERE job_id = ?''',
-                  (stage, checkpoint_json, now, error, job_id))
+                  (stage, checkpoint_json, datetime.utcnow(), error, job_id))
     else:
-        # Mid-job progress marker – keep status as 'processing'
+        # Successful stage – save progress
         c.execute('''UPDATE renders
                      SET current_stage   = ?,
                          checkpoint_data = ?
                      WHERE job_id = ?''',
                   (stage, checkpoint_json, job_id))
+
     conn.commit()
     conn.close()
     logger.info(f"💾 Checkpoint saved: job={job_id} stage={stage}")
@@ -1469,6 +1550,7 @@ def resume_job(job_id):
     conn.close()
 
     logger.info(f"▶️  Resuming Job {job_id} from stage '{resume_from}'")
+    logger.info(f"   Reusing checkpoint data to skip already-completed API calls")
 
     thread = threading.Thread(
         target=render_sequence_background,
@@ -1482,7 +1564,8 @@ def resume_job(job_id):
         "status": "resumed",
         "job_id": job_id,
         "resuming_from_stage": resume_from,
-        "status_url": f"https://{request.host}/tasks/{job_id}"
+        "status_url": f"https://{request.host}/tasks/{job_id}",
+        "note": "Reusing checkpoint data — skipping already-completed API calls"
     }), 202
 
 
