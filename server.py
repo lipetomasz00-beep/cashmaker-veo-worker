@@ -477,7 +477,7 @@ def save_checkpoint(job_id, stage, data=None, error=None):
                          retry_count     = ?,
                          next_retry_at   = ?
                      WHERE job_id = ?''',
-                  (stage, checkpoint_json, datetime.utcnow(), error, job_id))
+                  (stage, checkpoint_json, datetime.utcnow(), error, current_retry_count, next_retry_time, job_id))
     else:
         # Successful stage – save progress
         c.execute('''UPDATE renders
