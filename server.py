@@ -282,8 +282,22 @@ def init_db():
         error TEXT,
         video_duration REAL,
         created_at TIMESTAMP,
-        completed_at TIMESTAMP
+        completed_at TIMESTAMP,
+        current_stage TEXT,
+        checkpoint_data TEXT,
+        paused_at TIMESTAMP,
+        paused_reason TEXT
     )''')
+    # Migrate existing databases that are missing the checkpoint columns
+    existing_cols = {row[1] for row in c.execute("PRAGMA table_info(renders)")}
+    for col, col_def in [
+        ("current_stage",   "TEXT"),
+        ("checkpoint_data", "TEXT"),
+        ("paused_at",       "TIMESTAMP"),
+        ("paused_reason",   "TEXT"),
+    ]:
+        if col not in existing_cols:
+            c.execute(f"ALTER TABLE renders ADD COLUMN {col} {col_def}")
     conn.commit()
     conn.close()
 
@@ -306,30 +320,94 @@ def save_render_to_db(job_id, topic, status, video_url=None, error=None, video_d
     c = conn.cursor()
     completed_at = datetime.utcnow() if status in ['success', 'failed'] else None
     c.execute('''INSERT OR REPLACE INTO renders 
-                 (job_id, topic, status, video_url, error, video_duration, created_at, completed_at) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-              (job_id, topic, status, video_url, error, video_duration, datetime.utcnow(), completed_at))
+                 (job_id, topic, status, video_url, error, video_duration, created_at, completed_at,
+                  current_stage, checkpoint_data, paused_at, paused_reason) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                  COALESCE((SELECT current_stage  FROM renders WHERE job_id = ?), NULL),
+                  COALESCE((SELECT checkpoint_data FROM renders WHERE job_id = ?), NULL),
+                  COALESCE((SELECT paused_at       FROM renders WHERE job_id = ?), NULL),
+                  COALESCE((SELECT paused_reason   FROM renders WHERE job_id = ?), NULL))''',
+              (job_id, topic, status, video_url, error, video_duration, datetime.utcnow(), completed_at,
+               job_id, job_id, job_id, job_id))
     conn.commit()
     conn.close()
+
+def save_checkpoint(job_id, stage, data=None, error=None):
+    """Save a checkpoint so the job can be resumed from this stage on error.
+
+    When called with error=None (mid-job progress marker) the job status stays
+    'processing'.  When called with an error string the status is set to
+    'paused' so the resume endpoint can pick it up.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    checkpoint_json = json.dumps(data or {})
+    now = datetime.utcnow()
+    if error is not None:
+        # Job hit an error – pause it
+        c.execute('''UPDATE renders
+                     SET current_stage   = ?,
+                         checkpoint_data = ?,
+                         paused_at       = ?,
+                         paused_reason   = ?,
+                         status          = 'paused'
+                     WHERE job_id = ?''',
+                  (stage, checkpoint_json, now, error, job_id))
+    else:
+        # Mid-job progress marker – keep status as 'processing'
+        c.execute('''UPDATE renders
+                     SET current_stage   = ?,
+                         checkpoint_data = ?
+                     WHERE job_id = ?''',
+                  (stage, checkpoint_json, job_id))
+    conn.commit()
+    conn.close()
+    logger.info(f"💾 Checkpoint saved: job={job_id} stage={stage}")
+
+def get_checkpoint(job_id):
+    """Return checkpoint info for a paused job, or None if not found / not paused."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''SELECT current_stage, checkpoint_data, paused_at, paused_reason, status, topic
+                 FROM renders WHERE job_id = ?''', (job_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "current_stage":   row[0],
+        "checkpoint_data": json.loads(row[1]) if row[1] else {},
+        "paused_at":       row[2],
+        "paused_reason":   row[3],
+        "status":          row[4],
+        "topic":           row[5],
+    }
 
 def get_render_from_db(job_id):
     """Pobranie statusu renderowania z bazy"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT * FROM renders WHERE job_id = ?', (job_id,))
+    c.execute('''SELECT job_id, topic, status, video_url, error, video_duration,
+                        created_at, completed_at, current_stage, checkpoint_data,
+                        paused_at, paused_reason
+                 FROM renders WHERE job_id = ?''', (job_id,))
     row = c.fetchone()
     conn.close()
     
     if row:
         return {
-            "job_id": row[0],
-            "topic": row[1],
-            "status": row[2],
-            "video_url": row[3],
-            "error": row[4],
-            "video_duration": row[5],
-            "created_at": row[6],
-            "completed_at": row[7]
+            "job_id":          row[0],
+            "topic":           row[1],
+            "status":          row[2],
+            "video_url":       row[3],
+            "error":           row[4],
+            "video_duration":  row[5],
+            "created_at":      row[6],
+            "completed_at":    row[7],
+            "current_stage":   row[8],
+            "checkpoint_data": json.loads(row[9]) if row[9] else {},
+            "paused_at":       row[10],
+            "paused_reason":   row[11],
         }
     return None
 
@@ -392,8 +470,11 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
         
     if not operation.done:
         raise TimeoutError("❌ Veo API timeout podczas generowania segmentu.")
-        
+
     result = operation.result
+    if not result or not hasattr(result, 'generated_videos') or not result.generated_videos:
+        raise ValueError(f"❌ Veo API returned invalid response: {result}")
+
     video_uri = result.generated_videos[0].video.uri
     
     temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
@@ -433,14 +514,33 @@ def generate_audio_narration(narration_texts, job_id):
 
         try:
             # Nowe ElevenLabs zwraca strumień danych (generator), a nie gotowy plik
-            audio_stream = retry_with_backoff(
-                f"ElevenLabs text_to_speech ({scene_key})",
-                lambda: client.text_to_speech.convert(
-                    text=text,
-                    voice_id="pNInz6obpgDQGcFmaJgB",
-                    model_id="eleven_multilingual_v2"
+            # Try new API first, fallback to helper function
+            audio_stream = None
+            try:
+                logger.info(f"🎙️ Trying text_to_speech.convert()...")
+                audio_stream = retry_with_backoff(
+                    f"ElevenLabs text_to_speech.convert ({scene_key})",
+                    lambda: client.text_to_speech.convert(
+                        text=text,
+                        voice_id="pNInz6obpgDQGcFmaJgB",
+                        model_id="eleven_multilingual_v2"
+                    )
                 )
-            )
+            except Exception as e1:
+                logger.warning(f"⚠️ text_to_speech.convert() failed: {e1}. Trying generate()...")
+                try:
+                    audio_stream = retry_with_backoff(
+                        f"ElevenLabs generate ({scene_key})",
+                        lambda: client.generate(
+                            text=text,
+                            voice="Adam",
+                            model="eleven_multilingual_v2"
+                        )
+                    )
+                    logger.info(f"✅ Fallback to generate() worked!")
+                except Exception as e2:
+                    logger.error(f"❌ Both methods failed: convert={e1}, generate={e2}")
+                    raise e2
             
             # Bezpieczny zapis strumienia w kawałkach (chunkach) do pliku MP3
             with open(audio_file, "wb") as f:
@@ -819,17 +919,42 @@ NARRATION_TEMPLATES = {
     "rozwiązanie": "Regularne porównywanie ofert pozwala znaleźć korzystniejsze opcje i zaoszczędzić na rachunkach."
 }
 
-def render_sequence_background(job_id, raw_data, webhook_url=None):
+def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=None):
     """
     Główny proces montażu sekwencji - uruchamiany w tle
-    
+
     Schemat:
-    Temat → HOOK/PROBLEM/ROZWIĄZANIE → Veo → Lektor → Dopasowanie → 
+    Temat → HOOK/PROBLEM/ROZWIĄZANIE → Veo → Lektor → Dopasowanie →
     Napisy → Watermark → Plansza końcowa → Gotowy short
+
+    Parametry:
+        resume_from  – nazwa etapu (current_stage) od którego wznowić pracę,
+                       lub None gdy start od początku.
     """
+    # Ordered list of stage names used for skip-logic on resume
+    STAGES = [
+        "hook_video",
+        "problem_video",
+        "solution_video",
+        "narration",
+        "assembly",
+        "upload",
+    ]
+
+    def _stage_done(stage):
+        """Return True when this stage was already completed before the resume point."""
+        if resume_from is None:
+            return False
+        try:
+            return STAGES.index(stage) < STAGES.index(resume_from)
+        except ValueError:
+            return False
+
     segment_files = []
     audio_files_dict = {}
     srt_file = None
+    current_stage = "init"
+    job_paused = False
 
     try:
         client = get_gemini_client()
@@ -841,8 +966,11 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
         hashtags = raw_data.get("hashtags")
         if not hashtags:
             hashtags = build_hashtags(topic, custom_narration, MAX_HASHTAGS)
-        
-        logger.info(f"🚀 START renderowania Job ID: {job_id} | Temat: {topic}")
+
+        if resume_from:
+            logger.info(f"▶️  RESUME Job {job_id} | Wznawianie od etapu: {resume_from}")
+        else:
+            logger.info(f"🚀 START renderowania Job ID: {job_id} | Temat: {topic}")
 
         if ENABLE_DRY_RUN:
             logger.info("🧪 DRY_RUN enabled: skipping external providers and returning simulated success")
@@ -872,7 +1000,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
                 })
             METRICS["jobs_success"] += 1
             return
-        
+
         # ═══════════════════════════════════════════════════════════════
         # KROK 1: SZABLON MARKETINGOWY
         # ═══════════════════════════════════════════════════════════════
@@ -881,121 +1009,148 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
             "problem": f"A person looking anxiously at bills and charts on a screen, dark moody lighting, financial stress, 4k, professional",
             "rozwiązanie": f"Bright clean studio lighting, a smartphone screen displaying green rising financial growth charts, relief, 4k, professional"
         }
-        
+
         logger.info("📋 Szablon: HOOK → PROBLEM → ROZWIĄZANIE")
-        
+
         # ═══════════════════════════════════════════════════════════════
         # KROK 2: GENEROWANIE 3 KLIPÓW VEO
+        # Each clip has its own stage name so we can resume mid-way.
         # ═══════════════════════════════════════════════════════════════
+        stage_map = {
+            "hook":       "hook_video",
+            "problem":    "problem_video",
+            "rozwiązanie": "solution_video",
+        }
+
         for key, prompt_text in prompts.items():
+            stage_name = stage_map[key]
+
+            # On resume: if this clip was already generated, try to reuse it
+            if _stage_done(stage_name):
+                cached_path = os.path.join(tempfile.gettempdir(), f"seg_{job_id}_{key}.mp4")
+                if os.path.exists(cached_path):
+                    logger.info(f"⏩ Scena {key.upper()} już istnieje – pomijam Veo.")
+                    segment_files.append(cached_path)
+                    continue
+                # File was lost – regenerate it
+                logger.info(f"⚠️  Plik sceny {key} zaginął – regeneruję...")
+
+            current_stage = stage_name
+            save_checkpoint(job_id, current_stage, data={"topic": topic, "key": key})
             logger.info(f"🎥 Generowanie sceny: {key.upper()}")
             file_path = generate_video_segment(client, prompt_text, aspect_ratio)
-            segment_files.append(file_path)
+
+            # Persist with a stable name so resume can find it
+            stable_path = os.path.join(tempfile.gettempdir(), f"seg_{job_id}_{key}.mp4")
+            import shutil
+            shutil.copy2(file_path, stable_path)
+            os.remove(file_path)
+
+            segment_files.append(stable_path)
             logger.info(f"✅ Scena {key} gotowa")
-        
+
         logger.info(f"✅ Wszystkie 3 sceny gotowe")
-        
+
         # ═══════════════════════════════════════════════════════════════
         # KROK 3: GENEROWANIE LEKTORA (ElevenLabs)
         # ═══════════════════════════════════════════════════════════════
-        logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
-        
+        if not _stage_done("narration"):
+            current_stage = "narration"
+            save_checkpoint(job_id, current_stage, data={"topic": topic})
+            logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
+
         narration_texts = custom_narration if custom_narration else NARRATION_TEMPLATES
         audio_files_dict = generate_audio_narration(narration_texts, job_id)
-        
         logger.info(f"✅ Lektor wygenerowany")
-        
+
         # ═══════════════════════════════════════════════════════════════
         # KROK 4: GENEROWANIE NAPISÓW Z AUDIO (Whisper API)
         # ═══════════════════════════════════════════════════════════════
         srt_file = None
         try:
-            # Połącz wszystkie audio segmenty dla transkrypcji
             combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
             audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_trans_{job_id}.txt")
-            
+
             with open(audio_list_file, "w") as f:
                 for scene_key in ["hook", "problem", "rozwiązanie"]:
                     if scene_key in audio_files_dict:
                         f.write(f"file '{audio_files_dict[scene_key]['path']}'\n")
-            
+
             ffmpeg_concat = [
                 'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
                 '-c:a', 'libmp3lame', '-q:a', '4',
                 combined_for_transcription
             ]
             subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
+
             srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
-            
-            # Cleanup
+
             if os.path.exists(combined_for_transcription):
                 os.remove(combined_for_transcription)
             if os.path.exists(audio_list_file):
                 os.remove(audio_list_file)
-                
+
         except Exception as e:
             logger.warning(f"⚠️ Napisy niedostępne: {e}")
             srt_file = None
-        
+
         # ═══════════════════════════════════════════════════════════════
         # KROK 5: AUTOMATYCZNE DOPASOWANIE DŁUGOŚCI
         # ═══════════════════════════════════════════════════════════════
         logger.info("⏱️ Etap automatycznego dopasowania długości...")
-        
+
         target_duration = int(raw_data.get("targetDuration", 15))
         speed = calculate_video_speed(audio_files_dict, target_duration)
-        
+
         if speed != 1.0:
             logger.info(f"⚡ Dopasowywanie prędkości wideo do {speed:.2f}x...")
             segment_files = generate_video_with_speed_adjustment(segment_files, speed)
             logger.info(f"✅ Segmenty dopasowane")
-        
+
         # ═══════════════════════════════════════════════════════════════
         # KROK 6: GŁÓWNY MONTAŻ (WIDEO + AUDIO + NAPISY + WATERMARK)
         # ═══════════════════════════════════════════════════════════════
+        current_stage = "assembly"
+        save_checkpoint(job_id, current_stage, data={"topic": topic, "speed": speed})
         logger.info("🎬 Główny montaż (wideo + audio + napisy + watermark)...")
-        
+
         final_filename = f"render_{job_id}.mp4"
         final_output_path = os.path.join(STORAGE_DIR, final_filename)
-        
+
         concat_video_with_audio_and_subtitles(segment_files, audio_files_dict, srt_file, job_id, final_output_path, speed)
-        
+
         # ═══════════════════════════════════════════════════════════════
         # KROK 7: DODANIE PLANSZY KOŃCOWEJ
         # ═══════════════════════════════════════════════════════════════
         logger.info("🎨 Dodawanie planszy końcowej...")
-        
+
         endscreen_path = os.path.join(tempfile.gettempdir(), f"endscreen_{job_id}.mp4")
         generate_end_screen(job_id, topic, endscreen_path)
-        
-        # Konkatenacja: główne wideo + plansza końcowa
+
         final_with_endscreen = os.path.join(tempfile.gettempdir(), f"final_with_endscreen_{job_id}.mp4")
-        
+
         concat_list = os.path.join(tempfile.gettempdir(), f"final_concat_{job_id}.txt")
         with open(concat_list, "w") as f:
             f.write(f"file '{final_output_path}'\n")
             f.write(f"file '{endscreen_path}'\n")
-        
+
         ffmpeg_final_concat = [
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list,
             '-c', 'copy',
             final_with_endscreen
         ]
         subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        # Zmień na finalny plik
+
         os.replace(final_with_endscreen, final_output_path)
         logger.info(f"✅ Plansza końcowa dodana")
-        
-        # Cleanup
+
         for f in [endscreen_path, concat_list]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
                 except:
                     pass
-        
+
         # ═══════════════════════════════════════════════════════════════
         # KROK 8: POMIAR CZASU TRWANIA
         # ═══════════════════════════════════════════════════════════════
@@ -1005,21 +1160,23 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
             raise ValueError(
                 f"Output file too large: {file_size_mb:.1f} MB > {MAX_OUTPUT_VIDEO_MB} MB"
             )
-        
+
         logger.info(f"✅ SUKCES! Film gotowy: {final_filename}")
         logger.info(f"  ⏱️ Czas trwania: {video_duration:.2f}s")
         logger.info(f"  📊 Rozmiar: {file_size_mb:.1f} MB")
         logger.info(f"  ⚡ Prędkość: {speed:.2f}x")
-        
+
         video_url = f"https://{host}/videos/{final_filename}"
         logger.info(f"📺 URL: {video_url}")
-        
+
         # ═══════════════════════════════════════════════════════════════
-        # KROK 9: AKTUALIZACJA BAZY DANYCH
+        # KROK 9: UPLOAD / AKTUALIZACJA BAZY DANYCH
         # ═══════════════════════════════════════════════════════════════
+        current_stage = "upload"
+        save_checkpoint(job_id, current_stage, data={"video_url": video_url})
         save_render_to_db(job_id, topic, 'success', video_url, video_duration=video_duration)
         logger.info(f"💾 Historia zapisana")
-        
+
         # ═══════════════════════════════════════════════════════════════
         # KROK 10: WEBHOOK
         # ═══════════════════════════════════════════════════════════════
@@ -1049,54 +1206,63 @@ def render_sequence_background(job_id, raw_data, webhook_url=None):
                 logger.error(f"⚠️ Błąd webhook: {e}")
                 METRICS["webhook_failed"] += 1
         METRICS["jobs_success"] += 1
-                
+
     except Exception as e:
-        logger.error(f"❌ BŁĄD KRYTYCZNY Job {job_id}: {e}", exc_info=True)
+        logger.error(f"❌ BŁĄD KRYTYCZNY Job {job_id} na etapie '{current_stage}': {e}", exc_info=True)
         METRICS["jobs_failed"] += 1
         METRICS["last_error"] = str(e)
-        save_render_to_db(job_id, raw_data.get("topic", "Unknown"), 'failed', error=str(e))
-        
+
+        # ── PAUSE instead of fail ──────────────────────────────────────
+        job_paused = True
+        save_checkpoint(job_id, current_stage, error=str(e))
+        logger.error(f"⏸️ Job {job_id} PAUSED at '{current_stage}': {e}")
+
         if webhook_url:
             try:
                 webhook_payload = {
-                    "event_type": "render.failed",
+                    "event_type": "render.paused",
                     "job_id": job_id,
-                    "status": "failed",
+                    "status": "paused",
+                    "paused_at_stage": current_stage,
                     "error": str(e),
+                    "resume_url": f"https://{raw_data.get('host', 'localhost:5000')}/resume/{job_id}",
                     "source": "cashmaker-veo-worker",
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 send_webhook(webhook_url, webhook_payload)
-                logger.info(f"🔔 Webhook błędu wysłany")
+                logger.info(f"🔔 Webhook pauzy wysłany")
             except Exception as webhook_error:
                 logger.error(f"⚠️ Błąd webhook: {webhook_error}")
-                
+
     finally:
         RENDER_SEMAPHORE.release()
         # ═══════════════════════════════════════════════════════════════
-        # CLEANUP
+        # CLEANUP – skip temp files when paused so resume can reuse them
         # ═══════════════════════════════════════════════════════════════
-        logger.info("🧹 Czyszczenie plików tymczasowych...")
-        for path in segment_files:
-            if os.path.exists(path):
+        if job_paused:
+            logger.info("⏸️ Job paused – zachowuję pliki tymczasowe dla wznowienia.")
+        else:
+            logger.info("🧹 Czyszczenie plików tymczasowych...")
+            for path in segment_files:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Nie udało się usunąć {path}: {e}")
+
+            for scene_key, audio_info in audio_files_dict.items():
+                audio_path = audio_info.get("path")
+                if audio_path and os.path.exists(audio_path):
+                    try:
+                        os.remove(audio_path)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Nie udało się usunąć {audio_path}: {e}")
+
+            if srt_file and os.path.exists(srt_file):
                 try:
-                    os.remove(path)
-                except Exception as e:
-                    logger.warning(f"⚠️ Nie udało się usunąć {path}: {e}")
-        
-        for scene_key, audio_info in audio_files_dict.items():
-            audio_path = audio_info.get("path")
-            if audio_path and os.path.exists(audio_path):
-                try:
-                    os.remove(audio_path)
-                except Exception as e:
-                    logger.warning(f"⚠️ Nie udało się usunąć {audio_path}: {e}")
-        
-        if srt_file and os.path.exists(srt_file):
-            try:
-                os.remove(srt_file)
-            except:
-                pass
+                    os.remove(srt_file)
+                except:
+                    pass
 
 # ---------------------------------------------------------------------------
 # CLEANUP STARYCH PLIKÓW
@@ -1211,17 +1377,17 @@ def get_task_status(task_id):
         return auth_error
 
     render = get_render_from_db(task_id)
-    
+
     if not render:
         return jsonify({"error": "Task not found"}), 404
-    
+
     response = {
         "job_id": task_id,
         "state": render["status"],
         "created_at": render["created_at"],
         "completed_at": render["completed_at"]
     }
-    
+
     if render["status"] == "processing":
         response["status"] = "⏳ Przetwarzanie..."
     elif render["status"] == "success":
@@ -1231,8 +1397,85 @@ def get_task_status(task_id):
     elif render["status"] == "failed":
         response["status"] = "❌ Błąd wykonania"
         response["error"] = render["error"]
-    
+    elif render["status"] == "paused":
+        response["status"] = "⏸️ Wstrzymano – błąd na etapie"
+        response["paused_at_stage"] = render["current_stage"]
+        response["paused_at"] = render["paused_at"]
+        response["paused_reason"] = render["paused_reason"]
+        response["resume_url"] = f"https://{request.host}/resume/{task_id}"
+
     return jsonify(response)
+
+
+@app.route("/resume/<job_id>", methods=["POST"])
+def resume_job(job_id):
+    """
+    POST /resume/<job_id>
+    Headers: X-API-Key
+
+    Resumes a paused job from the checkpoint stage where it stopped.
+    Returns 409 if the job is not in 'paused' state.
+    """
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    checkpoint = get_checkpoint(job_id)
+
+    if not checkpoint:
+        return jsonify({"error": "Job not found"}), 404
+
+    if checkpoint["status"] != "paused":
+        return jsonify({
+            "error": "Job is not paused",
+            "current_status": checkpoint["status"],
+            "job_id": job_id
+        }), 409
+
+    if not RENDER_SEMAPHORE.acquire(blocking=False):
+        return jsonify({
+            "error": "Too many concurrent renders",
+            "max_concurrent_renders": MAX_CONCURRENT_RENDERS
+        }), 429
+
+    resume_from = checkpoint["current_stage"]
+    topic = checkpoint["topic"]
+
+    # Rebuild raw_data from checkpoint + any overrides supplied in the request body
+    override_data = request.json or {}
+    raw_data = {
+        "topic": topic,
+        "host": request.host,
+        **checkpoint["checkpoint_data"],
+        **override_data,
+    }
+    raw_data["host"] = request.host  # always use current host
+
+    webhook_url = raw_data.get("webhookUrl")
+
+    # Mark job as processing again before spawning the thread
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE renders SET status = 'processing' WHERE job_id = ?", (job_id,))
+    conn.commit()
+    conn.close()
+
+    logger.info(f"▶️  Resuming Job {job_id} from stage '{resume_from}'")
+
+    thread = threading.Thread(
+        target=render_sequence_background,
+        args=(job_id, raw_data, webhook_url),
+        kwargs={"resume_from": resume_from},
+        daemon=True
+    )
+    thread.start()
+
+    return jsonify({
+        "status": "resumed",
+        "job_id": job_id,
+        "resuming_from_stage": resume_from,
+        "status_url": f"https://{request.host}/tasks/{job_id}"
+    }), 202
 
 
 @app.route('/videos/<path:filename>')
@@ -1269,27 +1512,37 @@ def index():
     """API Info"""
     return jsonify({
         "name": "VeoVideo API",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "features": {
             "veo_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE)",
             "audio_narration": "ElevenLabs (głos Adam)",
             "subtitles": "Whisper API (automatyczna transkrypcja)",
             "watermark": "raport-finansowy24.pl (dolny róg)",
             "endscreen": "Plansza końcowa (3s)",
-            "auto_length_adjustment": "Dopasowanie prędkości do lektora"
+            "auto_length_adjustment": "Dopasowanie prędkości do lektora",
+            "checkpoint_resume": "Pause/resume – wznowienie od ostatniego etapu"
         },
         "endpoints": {
             "POST /render-sequence": "Uruchomienie renderowania",
             "GET /tasks/<job_id>": "Status renderowania",
+            "POST /resume/<job_id>": "Wznowienie wstrzymanego zadania od checkpointu",
             "GET /videos/<filename>": "Pobieranie wideo",
             "GET /health": "Health check"
-        }
+        },
+        "stages": [
+            "hook_video",
+            "problem_video",
+            "solution_video",
+            "narration",
+            "assembly",
+            "upload"
+        ]
     }), 200
 
 
 if __name__ == "__main__":
     validate_required_env()
-    logger.info("🚀 Startup VeoVideo API v3.0 (Napisy + Watermark + Plansza)")
+    logger.info("🚀 Startup VeoVideo API v3.1 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
     logger.info(f"📁 Storage: {STORAGE_DIR}")
     logger.info(f"🗄️  Database: {DB_PATH}")
     logger.info(f"🎙️ ElevenLabs: {'✅' if ELEVENLABS_API_KEY else '❌'}")
