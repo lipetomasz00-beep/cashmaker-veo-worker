@@ -44,6 +44,12 @@ FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "8"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("IDEMPOTENCY_TTL_SECONDS", "3600"))
 
+# Auto-retry configuration for paused jobs
+AUTO_RETRY_ENABLED = os.getenv("AUTO_RETRY_ENABLED", "true").lower() == "true"
+AUTO_RETRY_MAX_ATTEMPTS = int(os.getenv("AUTO_RETRY_MAX_ATTEMPTS", "3"))
+AUTO_RETRY_INITIAL_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_INITIAL_DELAY_SECONDS", "30"))
+AUTO_RETRY_MAX_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_MAX_DELAY_SECONDS", "600"))  # 10 minutes
+
 RATE_LIMIT_WINDOW = {}
 RATE_LIMIT_LOCK = threading.Lock()
 IDEMPOTENCY_CACHE = {}
@@ -314,7 +320,9 @@ def init_db():
         current_stage TEXT,
         checkpoint_data TEXT,
         paused_at TIMESTAMP,
-        paused_reason TEXT
+        paused_reason TEXT,
+        retry_count INTEGER DEFAULT 0,
+        next_retry_at TIMESTAMP
     )''')
     # Migrate existing databases that are missing the checkpoint columns
     existing_cols = {row[1] for row in c.execute("PRAGMA table_info(renders)")}
@@ -329,7 +337,28 @@ def init_db():
     conn.commit()
     conn.close()
 
+def ensure_retry_columns():
+    """Add retry_count and next_retry_at columns if they don't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Check if columns exist
+    c.execute("PRAGMA table_info(renders)")
+    columns = {row[1] for row in c.fetchall()}
+
+    if "retry_count" not in columns:
+        c.execute("ALTER TABLE renders ADD COLUMN retry_count INTEGER DEFAULT 0")
+        logger.info("✅ Added retry_count column to renders table")
+
+    if "next_retry_at" not in columns:
+        c.execute("ALTER TABLE renders ADD COLUMN next_retry_at TIMESTAMP")
+        logger.info("✅ Added next_retry_at column to renders table")
+
+    conn.commit()
+    conn.close()
+
 init_db()
+ensure_retry_columns()
 
 def get_gemini_client():
     """Inicjalizacja klienta Google Genai"""
@@ -421,23 +450,41 @@ def save_checkpoint(job_id, stage, data=None, error=None):
     checkpoint_json = json.dumps(data or {})
 
     if error is not None:
-        # Job hit an error – pause it and wait for manual resume
-        logger.warning(f"⏸️  Job {job_id} paused at stage '{stage}': {error}")
-        logger.info(f"📋 To resume: POST /resume/{job_id}")
+        # Get current retry count
+        c.execute("SELECT retry_count FROM renders WHERE job_id = ?", (job_id,))
+        row = c.fetchone()
+        current_retry_count = (row[0] if row and row[0] is not None else 0) + 1
 
+        # Calculate next retry time with exponential backoff
+        if AUTO_RETRY_ENABLED and current_retry_count <= AUTO_RETRY_MAX_ATTEMPTS:
+            delay = min(
+                AUTO_RETRY_INITIAL_DELAY_SECONDS * (2 ** (current_retry_count - 1)),
+                AUTO_RETRY_MAX_DELAY_SECONDS
+            )
+            next_retry_time = datetime.utcnow() + timedelta(seconds=delay)
+            logger.info(f"⏰ Job {job_id} will auto-retry in {delay}s (attempt {current_retry_count}/{AUTO_RETRY_MAX_ATTEMPTS})")
+        else:
+            next_retry_time = None
+            logger.warning(f"❌ Job {job_id} exceeded max retry attempts ({AUTO_RETRY_MAX_ATTEMPTS})")
+
+        # Job hit an error – pause it
         c.execute('''UPDATE renders
                      SET current_stage   = ?,
                          checkpoint_data = ?,
                          paused_at       = ?,
                          paused_reason   = ?,
-                         status          = 'paused'
+                         status          = 'paused',
+                         retry_count     = ?,
+                         next_retry_at   = ?
                      WHERE job_id = ?''',
                   (stage, checkpoint_json, datetime.utcnow(), error, job_id))
     else:
         # Successful stage – save progress
         c.execute('''UPDATE renders
                      SET current_stage   = ?,
-                         checkpoint_data = ?
+                         checkpoint_data = ?,
+                         retry_count     = 0,
+                         next_retry_at   = NULL
                      WHERE job_id = ?''',
                   (stage, checkpoint_json, job_id))
 
@@ -449,7 +496,8 @@ def get_checkpoint(job_id):
     """Return checkpoint info for a paused job, or None if not found / not paused."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''SELECT current_stage, checkpoint_data, paused_at, paused_reason, status, topic
+    c.execute('''SELECT current_stage, checkpoint_data, paused_at, paused_reason, status, topic,
+                        retry_count, next_retry_at
                  FROM renders WHERE job_id = ?''', (job_id,))
     row = c.fetchone()
     conn.close()
@@ -462,6 +510,8 @@ def get_checkpoint(job_id):
         "paused_reason":   row[3],
         "status":          row[4],
         "topic":           row[5],
+        "retry_count":     row[6] if row[6] is not None else 0,
+        "next_retry_at":   row[7],
     }
 
 def get_render_from_db(job_id):
@@ -470,11 +520,11 @@ def get_render_from_db(job_id):
     c = conn.cursor()
     c.execute('''SELECT job_id, topic, status, video_url, error, video_duration,
                         created_at, completed_at, current_stage, checkpoint_data,
-                        paused_at, paused_reason
+                        paused_at, paused_reason, retry_count, next_retry_at
                  FROM renders WHERE job_id = ?''', (job_id,))
     row = c.fetchone()
     conn.close()
-    
+
     if row:
         return {
             "job_id":          row[0],
@@ -489,6 +539,8 @@ def get_render_from_db(job_id):
             "checkpoint_data": json.loads(row[9]) if row[9] else {},
             "paused_at":       row[10],
             "paused_reason":   row[11],
+            "retry_count":     row[12] if row[12] is not None else 0,
+            "next_retry_at":   row[13],
         }
     return None
 
@@ -1492,6 +1544,9 @@ def get_task_status(task_id):
         response["paused_at"] = render["paused_at"]
         response["paused_reason"] = render["paused_reason"]
         response["resume_url"] = f"https://{request.host}/resume/{task_id}"
+        response["retry_count"] = render.get("retry_count", 0)
+        response["next_retry_at"] = render.get("next_retry_at")
+        response["auto_retry_enabled"] = AUTO_RETRY_ENABLED
 
     return jsonify(response)
 
@@ -1569,6 +1624,80 @@ def resume_job(job_id):
     }), 202
 
 
+def auto_retry_worker():
+    """Background thread that checks for paused jobs ready to retry."""
+    while True:
+        try:
+            if not AUTO_RETRY_ENABLED:
+                time.sleep(60)
+                continue
+
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+
+            # Find jobs that are paused and ready to retry
+            now = datetime.utcnow()
+            c.execute('''SELECT job_id, topic, checkpoint_data, current_stage, retry_count
+                         FROM renders
+                         WHERE status = 'paused'
+                         AND next_retry_at IS NOT NULL
+                         AND next_retry_at <= ?
+                         AND retry_count <= ?''',
+                      (now, AUTO_RETRY_MAX_ATTEMPTS))
+
+            jobs_to_retry = c.fetchall()
+            conn.close()
+
+            for job_id, topic, checkpoint_json, stage, retry_count in jobs_to_retry:
+                logger.info(f"🔄 Auto-retrying job {job_id} (attempt {retry_count}/{AUTO_RETRY_MAX_ATTEMPTS})")
+
+                try:
+                    checkpoint = json.loads(checkpoint_json) if checkpoint_json else {}
+
+                    # Acquire semaphore
+                    if not RENDER_SEMAPHORE.acquire(blocking=False):
+                        logger.warning(f"⚠️  Cannot retry {job_id}: too many concurrent renders")
+                        continue
+
+                    # Update status to processing
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute('''UPDATE renders
+                                 SET status = 'processing',
+                                     paused_at = NULL,
+                                     paused_reason = NULL,
+                                     next_retry_at = NULL
+                                 WHERE job_id = ?''', (job_id,))
+                    conn.commit()
+                    conn.close()
+
+                    # Rebuild raw_data from checkpoint
+                    raw_data = {
+                        "topic": topic,
+                        **checkpoint
+                    }
+
+                    # Start render thread
+                    thread = threading.Thread(
+                        target=render_sequence_background,
+                        args=(job_id, raw_data, None),
+                        kwargs={"resume_from": stage},
+                        daemon=True
+                    )
+                    thread.start()
+
+                except Exception as e:
+                    logger.error(f"❌ Failed to auto-retry job {job_id}: {e}")
+                    RENDER_SEMAPHORE.release()
+
+            # Check every 30 seconds
+            time.sleep(30)
+
+        except Exception as e:
+            logger.error(f"❌ Auto-retry worker error: {e}")
+            time.sleep(60)
+
+
 @app.route('/videos/<path:filename>')
 def serve_video(filename):
     """GET /videos/<filename>"""
@@ -1637,6 +1766,12 @@ if __name__ == "__main__":
     logger.info(f"📁 Storage: {STORAGE_DIR}")
     logger.info(f"🗄️  Database: {DB_PATH}")
     logger.info(f"🎙️ ElevenLabs: {'✅' if ELEVENLABS_API_KEY else '❌'}")
-    
+
     cleanup_old_files(hours=24)
+
+    # Start auto-retry worker thread
+    retry_thread = threading.Thread(target=auto_retry_worker, daemon=True)
+    retry_thread.start()
+    logger.info("✅ Auto-retry worker started")
+
     app.run(host="0.0.0.0", port=5000, threaded=True)
