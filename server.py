@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-MODEL = "veo-3.1-lite-generate-preview"
+MODEL = "veo-3.1-fast-generate-preview"
 STORAGE_DIR = os.getenv('STORAGE_DIR', '/app/data')
 DB_PATH = os.path.join(STORAGE_DIR, 'renders.db')
 os.makedirs(STORAGE_DIR, exist_ok=True)
