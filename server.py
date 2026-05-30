@@ -191,8 +191,8 @@ def validate_required_env():
         
         # Walidacja Gemini
         try:
-            client = get_gemini_client()
-        client.models.get(name=MODEL)
+            client = get_gemini_client()            
+            client.models.get(name=MODEL)
             logger.info("✅ Klucz GEMINI_API_KEY zweryfikowany pomyślnie.")
         except Exception as e:
             raise RuntimeError(f"GEMINI_API_KEY validation failed: {e}")
