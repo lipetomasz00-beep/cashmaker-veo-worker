@@ -24,21 +24,22 @@ from elevenlabs.client import ElevenLabs
 # ---------------------------------------------------------------------------
 # KONFIGURACJA I INICJALIZACJA
 # ---------------------------------------------------------------------------
+
+STORAGE_DIR = os.getenv('STORAGE_DIR', '/app/data')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 MODEL = "veo-3.1-fast-generate-preview"
-STORAGE_DIR = os.getenv('STORAGE_DIR', '/app/data')
 DB_PATH = os.path.join(STORAGE_DIR, 'renders.db')
 os.makedirs(STORAGE_DIR, exist_ok=True)
 MAX_CONCURRENT_RENDERS = int(os.getenv("MAX_CONCURRENT_RENDERS", "2"))
 RENDER_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_RENDERS)
 WORKER_API_KEY = os.getenv("WORKER_API_KEY")
 MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "16384"))
-MAX_NARRATION_CHARS = int(os.getenv("MAX_NARRATION_CHARS", "2000"))
-MAX_OUTPUT_VIDEO_MB = int(os.getenv("MAX_OUTPUT_VIDEO_MB", "120"))
+MAX_NARRATION_CHARS = int(os.getenv("MAX_NARRATION_CHARS", "800"))
+MAX_OUTPUT_VIDEO_MB = int(os.getenv("MAX_OUTPUT_VIDEO_MB", "500"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 ENABLE_AUTOMATION_RULES = os.getenv("ENABLE_AUTOMATION_RULES", "true").lower() == "true"
 MAX_HASHTAGS = int(os.getenv("MAX_HASHTAGS", "8"))
@@ -54,7 +55,7 @@ AUTO_RETRY_INITIAL_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_INITIAL_DELAY_SECON
 AUTO_RETRY_MAX_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_MAX_DELAY_SECONDS", "600"))  # 10 minutes
 
 # Hard execution timeout configuration for background jobs
-MAX_JOB_DURATION_SECONDS = int(os.getenv("MAX_JOB_DURATION_SECONDS", "600"))  # 10 minutes
+MAX_JOB_DURATION_SECONDS = int(os.getenv("MAX_JOB_DURATION_SECONDS", "1200"))  # 10 minutes
 IS_TESTING = os.getenv("TESTING", "false").lower() == "true"
 
 RATE_LIMIT_WINDOW = {}
