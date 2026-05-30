@@ -826,6 +826,12 @@ def generate_subtitles_from_audio(audio_file, job_id):
     
     Returns: ścieżka do pliku SRT
     """
+    # 1. POPRAWKA KOSZTÓW: Twardy cache dla pliku SRT
+    srt_path = os.path.join(tempfile.gettempdir(), f"subs_{job_id}.srt")
+    if os.path.exists(srt_path):
+        logger.info(f"⏩ Napisy dla zadania {job_id} już istnieją. Pomijam płatne API Whisper: {srt_path}")
+        return srt_path
+
     try:
         logger.info(f"📝 Transkrypcja audio (Whisper API)...")
         
@@ -864,7 +870,6 @@ def generate_subtitles_from_audio(audio_file, job_id):
                 srt_content += f"{text}\n\n"
                 srt_index += 1
         
-        srt_path = os.path.join(tempfile.gettempdir(), f"subs_{job_id}.srt")
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
         
@@ -891,14 +896,12 @@ def format_timestamp(seconds):
 # ---------------------------------------------------------------------------
 
 def generate_end_screen(job_id, topic, output_path):
-    """
-    Generowanie planszy końcowej (1080×1920 pioneer format)
-    
-    Layout:
-    - Top: Logo/Branding
-    - Middle: Topic title
-    - Bottom: CTA + Domain
-    """
+    """Generowanie planszy końcowej (1080×1920 pioneer format)"""
+    # 2. OPTYMALIZACJA: Pomijanie generowania jeśli plik końcowy już istnieje
+    if os.path.exists(output_path):
+        logger.info(f"⏩ Plansza końcowa już istnieje: {output_path}. Pomijam generowanie.")
+        return output_path
+
     logger.info(f"🎨 Generowanie planszy końcowej...")
     
     width, height = 1080, 1920
@@ -930,10 +933,11 @@ def generate_end_screen(job_id, topic, output_path):
     img.save(img_path)
     logger.info(f"✅ Plansza PNG: {img_path}")
     
+    # 3. POPRAWKA STABILNOŚCI: Limit threads i preset ultrafast dla FFmpeg
     ffmpeg_cmd = [
         'ffmpeg', '-y',
         '-loop', '1', '-i', img_path,
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-pix_fmt', 'yuv420p',
         '-t', '3',  # 3 sekund
         output_path
     ]
@@ -951,11 +955,10 @@ def generate_end_screen(job_id, topic, output_path):
 # ---------------------------------------------------------------------------
 
 def add_watermark(video_path, output_path, watermark_text="raport-finansowy24.pl", opacity=0.7):
-    """
-    Dodanie watermarku tekstowego do wideo
-    """
+    """Dodanie watermarku tekstowego do wideo"""
     logger.info(f"🏷️ Dodawanie watermarku: {watermark_text}")
     
+    # POPRAWKA STABILNOŚCI: Zapobieganie throttlowaniu CPU
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-i', video_path,
         '-vf', (
@@ -964,12 +967,12 @@ def add_watermark(video_path, output_path, watermark_text="raport-finansowy24.pl
             f"fontsize=24:fontcolor=white@{opacity}:"
             f"box=1:boxcolor=black@0.5"
         ),
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         output_path
     ]
     
-    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
     logger.info(f"✅ Watermark dodany")
     
     return output_path
@@ -988,8 +991,7 @@ def get_audio_duration(audio_file):
             audio_file
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        duration = float(result.stdout.strip())
-        return duration
+        return float(result.stdout.strip())
     except Exception as e:
         logger.warning(f"⚠️ Nie udało się pobrać czasu trwania {audio_file}: {e}")
         return 5.0
@@ -1004,8 +1006,7 @@ def get_video_duration(video_file):
             video_file
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        duration = float(result.stdout.strip())
-        return duration
+        return float(result.stdout.strip())
     except Exception as e:
         logger.warning(f"⚠️ Nie udało się pobrać czasu trwania {video_file}: {e}")
         return 5.0
@@ -1048,17 +1049,18 @@ def generate_video_with_speed_adjustment(segment_files, speed=1.0):
     for i, video_file in enumerate(segment_files):
         output_file = os.path.join(tempfile.gettempdir(), f"speed_{i}_{os.urandom(4).hex()}.mp4")
         
+        # POPRAWKA STABILNOŚCI: Zapobieganie throttlowaniu CPU na Railway
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-i', video_file,
             '-vf', f"setpts=PTS/{speed}",
             '-af', f"atempo={speed}",
-            '-c:v', 'libx264', '-preset', 'fast',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2',
             '-c:a', 'aac',
             output_file
         ]
         
         logger.info(f"  ⏱️ Segment {i}: {speed:.2f}x")
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
         
         speed_adjusted_files.append(output_file)
     
@@ -1072,6 +1074,10 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
     """
     Łączenie segmentów wideo + dodanie lektora + napisy + watermark
     """
+    # 1. OPTYMALIZACJA: Jeśli finalny plik istnieje, pomiń cały ciężki proces
+    if os.path.exists(output_path):
+        logger.info(f"⏩ Finalne wideo {job_id} już istnieje. Pomijam renderowanie.")
+        return output_path
     
     list_file_path = os.path.join(tempfile.gettempdir(), f"list_{job_id}.txt")
     with open(list_file_path, "w") as f:
@@ -1109,26 +1115,34 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
     
     logger.info("🎨 Etap 3: Miksowanie wideo + audio + napisy...")
     
-    video_filter = f"[0:v]setpts=PTS/{speed}"
+    # BŁĄD LOGICZNY USUNIĘTY: Skoro speed robimy w innej funkcji, tu dajemy zwykłe kopiowanie strumienia video (bez setpts)
+    # Zostawiamy po prostu wejście wideo bez modyfikacji czasu, żeby nie podwoić przyspieszenia.
+    video_filter = "[0:v]copy" if srt_file is None else "[0:v]format=yuv420p"
+    
+    # Budujemy łańcuch filtrów
+    filters = []
     
     if srt_file and os.path.exists(srt_file):
         srt_path_escaped = srt_file.replace("\\", "\\\\").replace(":", "\\:")
-        video_filter += f",subtitles='{srt_path_escaped}':force_style='FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&'"
+        # Eleganckie, wyraźne napisy dopasowane do profesjonalnego brandingu
+        filters.append(f"subtitles='{srt_path_escaped}':force_style='FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2,Shadow=0'")
         logger.info(f"✅ Napisy będą wypalane")
     
     watermark_text = "raport-finansowy24.pl"
-    video_filter += f",drawtext=text='{watermark_text}':x=w-text_w-20:y=h-text_h-20:fontsize=24:fontcolor=white@0.7:box=1:boxcolor=black@0.5"
+    filters.append(f"drawtext=text='{watermark_text}':x=w-text_w-20:y=h-text_h-20:fontsize=24:fontcolor=white@0.7:box=1:boxcolor=black@0.5")
     
-    video_filter += "[vout]"
+    # Łączymy filtry wideo przecinkami
+    final_video_filter = ",".join(filters)
     
     ffmpeg_final_cmd = [
         'ffmpeg', '-y',
         '-i', concat_output,
         '-i', combined_audio,
         '-filter_complex',
-        f"{video_filter};[1:a]volume=1.0[aout]",
+        f"[0:v]{final_video_filter}[vout];[1:a]volume=1.0[aout]",
         '-map', '[vout]', '-map', '[aout]',
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-crf', '23',
+        # STABILNOŚĆ: ultrafast i threads=2 zapobiegną zabiciu procesu przez Gunicorn
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
         output_path
     ]
