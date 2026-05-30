@@ -757,6 +757,7 @@ def generate_audio_narration(narration_texts, job_id):
 
         if os.path.exists(audio_file):
             logger.info(f"⏩ Lektor {scene_key} już istnieje. Pomijam ElevenLabs.")
+            # Zakładamy, że funkcja get_audio_duration jest zdefiniowana w dalszej części kodu
             duration = get_audio_duration(audio_file)
             audio_files[scene_key] = {
                 "path": audio_file,
