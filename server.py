@@ -384,10 +384,10 @@ def send_webhook(webhook_url, payload):
 
 def apply_optimization_rules(raw_data, topic):
     """
-    Prosta pętla feedbacku:
-    - Jeśli CTR/VTR są słabe, dostosuj CTA, tempo i narrację.
+    Pętla feedbacku:
+    - Jeśli CTR/VTR są słabe, dostosuj CTA, tempo i narrację do strategii konkretu i ekskluzywności.
     Wejście:
-      raw_data["performance"] = {"ctr": 0.01, "vtr": 0.12}
+        raw_data["performance"] = {"ctr": 0.01, "vtr": 0.12}
     """
     if not ENABLE_AUTOMATION_RULES:
         return raw_data
@@ -398,16 +398,16 @@ def apply_optimization_rules(raw_data, topic):
     narration = raw_data.get("narration") or {}
     optimizations = []
 
-    # Rule 1: słaby CTR => mocniejszy hook i CTA
+    # Rule 1: słaby CTR => Dostarczenie twardych faktów i prestiżowego wezwania (zamiast taniej agresji)
     if ctr and ctr < 0.012:
-        narration["hook"] = f"Tracisz pieniądze na {topic}. Sprawdź to przed końcem dnia."
-        raw_data["ctaText"] = "Sprawdź ranking teraz: raport-finansowy24.pl"
-        optimizations.append("low_ctr_hook_cta_boost")
+        narration["hook"] = f"Analiza rynku ujawnia nieoczywiste koszty w obszarze {topic}. Zobacz niezależne zestawienie faktów."
+        raw_data["ctaText"] = "Pobierz bezpłatny raport i porównaj warunki: raport-finansowy24.pl"
+        optimizations.append("low_ctr_exclusive_factual_boost")
 
     # Rule 2: słaby VTR => krótsza/jaśniejsza narracja + szybsze tempo
     if vtr and vtr < 0.20:
-        narration["problem"] = "To częsty błąd: wybór konta bez porównania warunków."
-        narration["rozwiązanie"] = "Porównanie ofert zajmuje chwilę i może realnie obniżyć koszty."
+        narration["problem"] = "Najczęstszy błąd rynkowy to wybór oferty bez dokładnej weryfikacji parametrów."
+        narration["rozwiązanie"] = "Dostęp do rzetelnych danych pozwala podjąć decyzję w oparciu o czyste liczby, a nie obietnice."
         raw_data["targetDuration"] = 12
         optimizations.append("low_vtr_shorter_story")
 
@@ -469,8 +469,10 @@ def get_gemini_client():
     )
 
 def call_gemini_with_cache(prompt, cache_key_prefix, max_retries=2):
-    """Call Gemini API with caching to minimize costs."""
-    cache_key = f"gemini:{cache_key_prefix}:{hash(prompt) % 10000}"
+    """Call Gemini API with STABLE caching to minimize costs."""
+    # Użycie MD5 zamiast losowego hash(), aby cache przetrwał restarty serwera
+    prompt_hash = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:10]
+    cache_key = f"gemini:{cache_key_prefix}:{prompt_hash}"
 
     # Check cache first
     cached = get_cached_api_response(cache_key)
@@ -511,8 +513,10 @@ def generate_audio_with_elevenlabs(text, voice_id="pNInz6obpgDQGcFmaJgB"):
     return audio_data
 
 def call_elevenlabs_with_cache(text, voice_id, cache_key_prefix, max_retries=2):
-    """Call ElevenLabs API with caching to minimize costs."""
-    cache_key = f"elevenlabs:{cache_key_prefix}:{hash(text) % 10000}"
+    """Call ElevenLabs API with STABLE caching to minimize costs."""
+    # Użycie MD5 zamiast losowego hash(), aby cache przetrwał restarty serwera
+    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()[:10]
+    cache_key = f"elevenlabs:{cache_key_prefix}:{text_hash}"
 
     # Check cache first
     cached = get_cached_api_response(cache_key)
@@ -535,7 +539,6 @@ def call_elevenlabs_with_cache(text, voice_id, cache_key_prefix, max_retries=2):
             time.sleep(2 ** attempt)
 
     raise RuntimeError("ElevenLabs API failed after retries")
-
 # ---------------------------------------------------------------------------
 # HISTORIA RENDERÓW (SQLite)
 # ---------------------------------------------------------------------------
