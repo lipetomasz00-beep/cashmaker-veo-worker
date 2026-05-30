@@ -546,7 +546,18 @@ def save_render_to_db(job_id, topic, status, video_url=None, error=None, video_d
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     completed_at = datetime.utcnow() if status in ['success', 'failed'] else None
-    c.execute('''INSERT OR REPLACE INTO renders \n                 (job_id, topic, status, video_url, error, video_duration, created_at, completed_at,\n                  current_stage, checkpoint_data, paused_at, paused_reason) \n                 VALUES (?, ?, ?, ?, ?, ?, ?, ?,\n                  COALESCE((SELECT current_stage  FROM renders WHERE job_id = ?), NULL),\n                  COALESCE((SELECT checkpoint_data FROM renders WHERE job_id = ?), NULL),\n                  COALESCE((SELECT paused_at       FROM renders WHERE job_id = ?), NULL),\n                  COALESCE((SELECT paused_reason   FROM renders WHERE job_id = ?), NULL))''',\n              (job_id, topic, status, video_url, error, video_duration, datetime.utcnow(), completed_at,\n               job_id, job_id, job_id, job_id))\n    conn.commit()\n    conn.close()
+    c.execute('''INSERT OR REPLACE INTO renders
+                 (job_id, topic, status, video_url, error, video_duration, created_at, completed_at,
+                  current_stage, checkpoint_data, paused_at, paused_reason)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                  COALESCE((SELECT current_stage  FROM renders WHERE job_id = ?), NULL),
+                  COALESCE((SELECT checkpoint_data FROM renders WHERE job_id = ?), NULL),
+                  COALESCE((SELECT paused_at       FROM renders WHERE job_id = ?), NULL),
+                  COALESCE((SELECT paused_reason   FROM renders WHERE job_id = ?), NULL))''',
+              (job_id, topic, status, video_url, error, video_duration, datetime.utcnow(), completed_at,
+               job_id, job_id, job_id, job_id))
+    conn.commit()
+    conn.close()
 
 def save_checkpoint(job_id, stage, data=None, error=None):
     """Save a checkpoint so the job can be resumed from this stage on error."""
