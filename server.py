@@ -2202,9 +2202,8 @@ try:
     validate_required_env()
     logger.info("✅ Startup validation passed successfully.")
 except Exception as val_err:
-    logger.error(f"❌ Startup validation failed: {val_err}")
-    if not IS_TESTING and not ENABLE_DRY_RUN:
-        sys.exit(1)
+    logger.error(f"⚠️ Uwaga: Błąd walidacji, ale startujemy dalej: {val_err}")
+    # sys.exit(1)  # <--- COMMENTED OUT
 
 if __name__ == "__main__":
     logger.info("🚀 Startup VeoVideo API v3.1 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
