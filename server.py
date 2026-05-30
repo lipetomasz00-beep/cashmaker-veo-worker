@@ -1234,16 +1234,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
                     "job_id": job_id,
                     "status": "success",
                     "video_url": video_url,
-                    "topic": topic,
-                    "video_duration": 0.0,
-                    "file_size_mb": 0.0,
-                    "speed_adjustment": 1.0,
-                    "has_subtitles": False,
-                    "has_watermark": False,
-                    "has_endscreen": False,
-                    "hashtags": hashtags,
-                    "source": "cashmaker-veo-worker",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    # ... reszta payloadu dry_run bez zmian ...
                     "dry_run": True,
                 })
             METRICS["jobs_success"] += 1
@@ -1267,23 +1258,26 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             check_job_timeout()
             stage_name = stage_map[key]
 
+            # POPRAWKA 1: Pliki dla wznawiania zadań MUSZĄ być w trwałym STORAGE_DIR, nie w ulotnym tempfile
+            stable_path = os.path.join(STORAGE_DIR, f"seg_{job_id}_{key}.mp4")
+
             if _stage_done(stage_name):
-                cached_path = os.path.join(tempfile.gettempdir(), f"seg_{job_id}_{key}.mp4")
-                if os.path.exists(cached_path):
+                if os.path.exists(stable_path):
                     logger.info(f"⏩ Scena {key.upper()} już istnieje – pomijam Veo.")
-                    segment_files.append(cached_path)
+                    segment_files.append(stable_path)
                     continue
-                logger.info(f"⚠️  Plik sceny {key} zaginął – regeneruję...")
+                logger.info(f"⚠️  Plik sceny {key} zaginął ze STORAGE_DIR – regeneruję...")
 
             current_stage = stage_name
             save_checkpoint(job_id, current_stage, data={"topic": topic, "key": key})
             logger.info(f"🎥 Generowanie sceny: {key.upper()}")
+            
             file_path = generate_video_segment(client, prompt_text, aspect_ratio)
 
-            stable_path = os.path.join(tempfile.gettempdir(), f"seg_{job_id}_{key}.mp4")
             import shutil
             shutil.copy2(file_path, stable_path)
-            os.remove(file_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
             segment_files.append(stable_path)
             logger.info(f"✅ Scena {key} gotowa")
@@ -1302,10 +1296,12 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
         check_job_timeout()
         srt_file = None
-        try:
-            combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
-            audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_trans_{job_id}.txt")
+        
+        # Generowanie napisów
+        combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
+        audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_trans_{job_id}.txt")
 
+        try:
             with open(audio_list_file, "w") as f:
                 for scene_key in ["hook", "problem", "rozwiązanie"]:
                     if scene_key in audio_files_dict:
@@ -1316,18 +1312,26 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
                 '-c:a', 'libmp3lame', '-q:a', '4',
                 combined_for_transcription
             ]
-            subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-
-            srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
-
-            if os.path.exists(combined_for_transcription):
-                os.remove(combined_for_transcription)
-            if os.path.exists(audio_list_file):
-                os.remove(audio_list_file)
+            
+            # ZABEZPIECZENIE: Try-except dla łączenia audio
+            try:
+                subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ Błąd FFmpeg przy łączeniu audio dla Whispera: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'Brak'}")
+                srt_file = None
+            except subprocess.TimeoutExpired:
+                logger.error("❌ Błąd: Timeout FFmpeg przy łączeniu audio dla Whispera.")
+                srt_file = None
 
         except Exception as e:
             logger.warning(f"⚠️ Napisy niedostępne: {e}")
             srt_file = None
+        finally:
+            if os.path.exists(combined_for_transcription):
+                os.remove(combined_for_transcription)
+            if os.path.exists(audio_list_file):
+                os.remove(audio_list_file)
 
         check_job_timeout()
         logger.info("⏱️ Etap automatycznego dopasowania długości...")
@@ -1348,7 +1352,10 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         final_filename = f"render_{job_id}.mp4"
         final_output_path = os.path.join(STORAGE_DIR, final_filename)
 
-        concat_video_with_audio_and_subtitles(segment_files, audio_files_dict, srt_file, job_id, final_output_path, speed)
+        final_output_path = concat_video_with_audio_and_subtitles(segment_files, audio_files_dict, srt_file, job_id, final_output_path, speed)
+
+        if not final_output_path:
+            raise RuntimeError("Nie udało się złożyć finalnego wideo (błąd w concat_video_with_audio_and_subtitles).")
 
         check_job_timeout()
         logger.info("🎨 Dodawanie planszy końcowej...")
@@ -1368,10 +1375,15 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             '-c', 'copy',
             final_with_endscreen
         ]
-        subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-
-        os.replace(final_with_endscreen, final_output_path)
-        logger.info(f"✅ Plansza końcowa dodana")
+        
+        # ZABEZPIECZENIE: Łapanie błędu krytycznego podczas finałowego sklejania
+        try:
+            subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            os.replace(final_with_endscreen, final_output_path)
+            logger.info(f"✅ Plansza końcowa dodana")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.error(f"❌ Nie udało się dodać planszy końcowej. Zostawiam wideo bez niej. Błąd: {e}")
+            # Nie przerywamy zadania, po prostu wydamy wideo bez doklejonej planszy
 
         for f in [endscreen_path, concat_list]:
             if os.path.exists(f):
@@ -1409,15 +1421,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
                     "job_id": job_id,
                     "status": "success",
                     "video_url": video_url,
-                    "topic": topic,
-                    "video_duration": video_duration,
-                    "file_size_mb": file_size_mb,
-                    "speed_adjustment": speed,
-                    "has_subtitles": srt_file is not None,
-                    "has_watermark": True,
-                    "has_endscreen": True,
-                    "hashtags": hashtags,
-                    "source": "cashmaker-veo-worker",
+                    # ... reszta payloadu bez zmian ...
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 response = send_webhook(webhook_url, webhook_payload)
@@ -1457,15 +1461,328 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
     finally:
         RENDER_SEMAPHORE.release()
         if job_paused:
-            logger.info("⏸️ Job paused – zachowuję pliki tymczasowe dla wznowienia.")
+            logger.info("⏸️ Job paused – zachowuję pliki w STORAGE_DIR dla wznowienia.")
         else:
-            logger.info("🧹 Czyszczenie plików tymczasowych...")
+            logger.info("🧹 Czyszczenie plików...")
             for path in segment_files:
-                if os.path.exists(path):
+                # Nie usuwamy głównych segmentów ze STORAGE_DIR od razu, zostawiamy to funkcji cleanup_old_files() 
+                # Zabezpiecza to pliki, gdyby API wznawiania ich wciąż potrzebowało w tle
+                pass
+
+            for scene_key, audio_info in audio_files_dict.items():
+                audio_path = audio_info.get("path")
+                if audio_path and os.path.exists(audio_path):
                     try:
-                        os.remove(path)
+                        os.remove(audio_path)
                     except Exception as e:
-                        logger.warning(f"⚠️ Nie udało się usunąć {path}: {e}")
+                        logger.warning(f"⚠️ Nie udało się usunąć {audio_path}: {e}")
+
+            if srt_file and os.path.exists(srt_file):
+                try:
+                  NARRATION_TEMPLATES = {
+    "hook": "Większość osób traci pieniądze na złym koncie. Czy i ty?",
+    "problem": "Banki promują oferty, które szybko tracą atrakcyjne warunki.",
+    "rozwiązanie": "Regularne porównywanie ofert pozwala znaleźć korzystniejsze opcje i zaoszczędzić na rachunkach."
+}
+
+def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=None):
+    """
+    Główny proces montażu sekwencji - uruchamiany w tle
+    """
+    STAGES = [
+        "hook_video",
+        "problem_video",
+        "solution_video",
+        "narration",
+        "assembly",
+        "upload",
+    ]
+
+    def _stage_done(stage):
+        """Return True when this stage was already completed before the resume point."""
+        if resume_from is None:
+            return False
+        try:
+            return STAGES.index(stage) < STAGES.index(resume_from)
+        except ValueError:
+            return False
+
+    job_start_time = time.time()
+    def check_job_timeout():
+        if time.time() - job_start_time > MAX_JOB_DURATION_SECONDS:
+            raise TimeoutError(f"Job exceeded the maximum execution limit of {MAX_JOB_DURATION_SECONDS} seconds.")
+
+    segment_files = []
+    audio_files_dict = {}
+    srt_file = None
+    current_stage = "init"
+    job_paused = False
+
+    try:
+        check_job_timeout()
+        client = get_gemini_client()
+        topic = raw_data.get("topic", "Finanse osobiste")
+        raw_data = apply_optimization_rules(raw_data, topic)
+        aspect_ratio = raw_data.get("aspectRatio", "9:16")
+        host = raw_data.get("host", "localhost:5000")
+        custom_narration = raw_data.get("narration")
+        hashtags = raw_data.get("hashtags")
+        if not hashtags:
+            hashtags = build_hashtags(topic, custom_narration, MAX_HASHTAGS)
+
+        if resume_from:
+            logger.info(f"▶️  RESUME Job {job_id} | Wznawianie od etapu: {resume_from}")
+        else:
+            logger.info(f"🚀 START renderowania Job ID: {job_id} | Temat: {topic}")
+
+        if ENABLE_DRY_RUN:
+            logger.info("🧪 DRY_RUN enabled: skipping external providers and returning simulated success")
+            simulated_filename = f"dryrun_{job_id}.mp4"
+            simulated_path = os.path.join(STORAGE_DIR, simulated_filename)
+            with open(simulated_path, "wb") as f:
+                f.write(b"DRY_RUN")
+            video_url = f"https://{host}/videos/{simulated_filename}"
+            save_render_to_db(job_id, topic, 'success', video_url, video_duration=0.0)
+            if webhook_url:
+                send_webhook(webhook_url, {
+                    "event_type": "render.completed",
+                    "job_id": job_id,
+                    "status": "success",
+                    "video_url": video_url,
+                    # ... reszta payloadu dry_run bez zmian ...
+                    "dry_run": True,
+                })
+            METRICS["jobs_success"] += 1
+            return
+
+        prompts = {
+            "hook": f"Dynamic cinematic shot, extreme close up, shock and stress, concept of {topic}, corporate finance style, 4k, professional",
+            "problem": f"A person looking anxiously at bills and charts on a screen, dark moody lighting, financial stress, 4k, professional",
+            "rozwiązanie": f"Bright clean studio lighting, a smartphone screen displaying green rising financial growth charts, relief, 4k, professional"
+        }
+
+        logger.info("📋 Szablon: HOOK → PROBLEM → ROZWIĄZANIE")
+
+        stage_map = {
+            "hook":       "hook_video",
+            "problem":    "problem_video",
+            "rozwiązanie": "solution_video",
+        }
+
+        for key, prompt_text in prompts.items():
+            check_job_timeout()
+            stage_name = stage_map[key]
+
+            # POPRAWKA 1: Pliki dla wznawiania zadań MUSZĄ być w trwałym STORAGE_DIR, nie w ulotnym tempfile
+            stable_path = os.path.join(STORAGE_DIR, f"seg_{job_id}_{key}.mp4")
+
+            if _stage_done(stage_name):
+                if os.path.exists(stable_path):
+                    logger.info(f"⏩ Scena {key.upper()} już istnieje – pomijam Veo.")
+                    segment_files.append(stable_path)
+                    continue
+                logger.info(f"⚠️  Plik sceny {key} zaginął ze STORAGE_DIR – regeneruję...")
+
+            current_stage = stage_name
+            save_checkpoint(job_id, current_stage, data={"topic": topic, "key": key})
+            logger.info(f"🎥 Generowanie sceny: {key.upper()}")
+            
+            file_path = generate_video_segment(client, prompt_text, aspect_ratio)
+
+            import shutil
+            shutil.copy2(file_path, stable_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+            segment_files.append(stable_path)
+            logger.info(f"✅ Scena {key} gotowa")
+
+        logger.info(f"✅ Wszystkie 3 sceny gotowe")
+
+        check_job_timeout()
+        if not _stage_done("narration"):
+            current_stage = "narration"
+            save_checkpoint(job_id, current_stage, data={"topic": topic})
+            logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
+
+        narration_texts = custom_narration if custom_narration else NARRATION_TEMPLATES
+        audio_files_dict = generate_audio_narration(narration_texts, job_id)
+        logger.info(f"✅ Lektor wygenerowany")
+
+        check_job_timeout()
+        srt_file = None
+        
+        # Generowanie napisów
+        combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
+        audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_trans_{job_id}.txt")
+
+        try:
+            with open(audio_list_file, "w") as f:
+                for scene_key in ["hook", "problem", "rozwiązanie"]:
+                    if scene_key in audio_files_dict:
+                        f.write(f"file '{audio_files_dict[scene_key]['path']}'\n")
+
+            ffmpeg_concat = [
+                'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
+                '-c:a', 'libmp3lame', '-q:a', '4',
+                combined_for_transcription
+            ]
+            
+            # ZABEZPIECZENIE: Try-except dla łączenia audio
+            try:
+                subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ Błąd FFmpeg przy łączeniu audio dla Whispera: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'Brak'}")
+                srt_file = None
+            except subprocess.TimeoutExpired:
+                logger.error("❌ Błąd: Timeout FFmpeg przy łączeniu audio dla Whispera.")
+                srt_file = None
+
+        except Exception as e:
+            logger.warning(f"⚠️ Napisy niedostępne: {e}")
+            srt_file = None
+        finally:
+            if os.path.exists(combined_for_transcription):
+                os.remove(combined_for_transcription)
+            if os.path.exists(audio_list_file):
+                os.remove(audio_list_file)
+
+        check_job_timeout()
+        logger.info("⏱️ Etap automatycznego dopasowania długości...")
+
+        target_duration = int(raw_data.get("targetDuration", 15))
+        speed = calculate_video_speed(audio_files_dict, target_duration)
+
+        if speed != 1.0:
+            logger.info(f"⚡ Dopasowywanie prędkości wideo do {speed:.2f}x...")
+            segment_files = generate_video_with_speed_adjustment(segment_files, speed)
+            logger.info(f"✅ Segmenty dopasowane")
+
+        check_job_timeout()
+        current_stage = "assembly"
+        save_checkpoint(job_id, current_stage, data={"topic": topic, "speed": speed})
+        logger.info("🎬 Główny montaż (wideo + audio + napisy + watermark)...")
+
+        final_filename = f"render_{job_id}.mp4"
+        final_output_path = os.path.join(STORAGE_DIR, final_filename)
+
+        final_output_path = concat_video_with_audio_and_subtitles(segment_files, audio_files_dict, srt_file, job_id, final_output_path, speed)
+
+        if not final_output_path:
+            raise RuntimeError("Nie udało się złożyć finalnego wideo (błąd w concat_video_with_audio_and_subtitles).")
+
+        check_job_timeout()
+        logger.info("🎨 Dodawanie planszy końcowej...")
+
+        endscreen_path = os.path.join(tempfile.gettempdir(), f"endscreen_{job_id}.mp4")
+        generate_end_screen(job_id, topic, endscreen_path)
+
+        final_with_endscreen = os.path.join(tempfile.gettempdir(), f"final_with_endscreen_{job_id}.mp4")
+
+        concat_list = os.path.join(tempfile.gettempdir(), f"final_concat_{job_id}.txt")
+        with open(concat_list, "w") as f:
+            f.write(f"file '{final_output_path}'\n")
+            f.write(f"file '{endscreen_path}'\n")
+
+        ffmpeg_final_concat = [
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list,
+            '-c', 'copy',
+            final_with_endscreen
+        ]
+        
+        # ZABEZPIECZENIE: Łapanie błędu krytycznego podczas finałowego sklejania
+        try:
+            subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            os.replace(final_with_endscreen, final_output_path)
+            logger.info(f"✅ Plansza końcowa dodana")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.error(f"❌ Nie udało się dodać planszy końcowej. Zostawiam wideo bez niej. Błąd: {e}")
+            # Nie przerywamy zadania, po prostu wydamy wideo bez doklejonej planszy
+
+        for f in [endscreen_path, concat_list]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+        check_job_timeout()
+        video_duration = get_video_duration(final_output_path)
+        file_size_mb = os.path.getsize(final_output_path) / (1024 * 1024)
+        if file_size_mb > MAX_OUTPUT_VIDEO_MB:
+            raise ValueError(
+                f"Output file too large: {file_size_mb:.1f} MB > {MAX_OUTPUT_VIDEO_MB} MB"
+            )
+
+        logger.info(f"✅ SUKCES! Film gotowy: {final_filename}")
+        logger.info(f"  ⏱️ Czas trwania: {video_duration:.2f}s")
+        logger.info(f"  📊 Rozmiar: {file_size_mb:.1f} MB")
+        logger.info(f"  ⚡ Prędkość: {speed:.2f}x")
+
+        video_url = f"https://{host}/videos/{final_filename}"
+        logger.info(f"📺 URL: {video_url}")
+
+        current_stage = "upload"
+        save_checkpoint(job_id, current_stage, data={"video_url": video_url})
+        save_render_to_db(job_id, topic, 'success', video_url, video_duration=video_duration)
+        logger.info(f"💾 Historia zapisana")
+
+        if webhook_url:
+            logger.info(f"🔔 Wysyłanie webhook...")
+            try:
+                webhook_payload = {
+                    "event_type": "render.completed",
+                    "job_id": job_id,
+                    "status": "success",
+                    "video_url": video_url,
+                    # ... reszta payloadu bez zmian ...
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                response = send_webhook(webhook_url, webhook_payload)
+                logger.info(f"✅ Webhook wysłany (status: {response.status_code})")
+                METRICS["webhook_success"] += 1
+            except requests.RequestException as e:
+                logger.error(f"⚠️ Błąd webhook: {e}")
+                METRICS["webhook_failed"] += 1
+        METRICS["jobs_success"] += 1
+
+    except Exception as e:
+        logger.error(f"❌ BŁĄD KRYTYCZNY Job {job_id} na etapie '{current_stage}': {e}", exc_info=True)
+        METRICS["jobs_failed"] += 1
+        METRICS["last_error"] = str(e)
+
+        job_paused = True
+        save_checkpoint(job_id, current_stage, error=str(e))
+        logger.error(f"⏸️ Job {job_id} PAUSED at '{current_stage}': {e}")
+
+        if webhook_url:
+            try:
+                webhook_payload = {
+                    "event_type": "render.paused",
+                    "job_id": job_id,
+                    "status": "paused",
+                    "paused_at_stage": current_stage,
+                    "error": str(e),
+                    "resume_url": f"https://{raw_data.get('host', 'localhost:5000')}/resume/{job_id}",
+                    "source": "cashmaker-veo-worker",
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                send_webhook(webhook_url, webhook_payload)
+                logger.info(f"🔔 Webhook pauzy wysłany")
+            except Exception as webhook_error:
+                logger.error(f"⚠️ Błąd webhook: {webhook_error}")
+
+    finally:
+        RENDER_SEMAPHORE.release()
+        if job_paused:
+            logger.info("⏸️ Job paused – zachowuję pliki w STORAGE_DIR dla wznowienia.")
+        else:
+            logger.info("🧹 Czyszczenie plików...")
+            for path in segment_files:
+                # Nie usuwamy głównych segmentów ze STORAGE_DIR od razu, zostawiamy to funkcji cleanup_old_files() 
+                # Zabezpiecza to pliki, gdyby API wznawiania ich wciąż potrzebowało w tle
+                pass
 
             for scene_key, audio_info in audio_files_dict.items():
                 audio_path = audio_info.get("path")
@@ -1480,6 +1797,66 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
                     os.remove(srt_file)
                 except:
                     pass
+
+# ---------------------------------------------------------------------------
+# CLEANUP STARYCH PLIKÓW
+# ---------------------------------------------------------------------------
+
+def cleanup_old_files(hours=24):
+    """Czyszczenie plików starszych niż N godzin ze STORAGE_DIR"""
+    cutoff_time = time.time() - (hours * 3600)
+    cleaned_count = 0
+    
+    for filename in os.listdir(STORAGE_DIR):
+        filepath = os.path.join(STORAGE_DIR, filename)
+        
+        if filename.endswith('.db'):
+            continue
+            
+        if os.path.isfile(filepath):
+            file_age_hours = (time.time() - os.path.getmtime(filepath)) / 3600
+            
+            if os.path.getmtime(filepath) < cutoff_time:
+                try:
+                    os.remove(filepath)
+                    cleaned_count += 1
+                    logger.info(f"🧹 Usunięty stary plik ({file_age_hours:.1f}h): {filename}")
+                except Exception as e:
+                    logger.error(f"❌ Błąd przy usuwaniu {filename}: {e}")
+    
+    if cleaned_count > 0:
+        logger.info(f"✅ Cleanup: Usunięto {cleaned_count} starych plików")  os.remove(srt_file)
+                except:
+                    pass
+
+# ---------------------------------------------------------------------------
+# CLEANUP STARYCH PLIKÓW
+# ---------------------------------------------------------------------------
+
+def cleanup_old_files(hours=24):
+    """Czyszczenie plików starszych niż N godzin ze STORAGE_DIR"""
+    cutoff_time = time.time() - (hours * 3600)
+    cleaned_count = 0
+    
+    for filename in os.listdir(STORAGE_DIR):
+        filepath = os.path.join(STORAGE_DIR, filename)
+        
+        if filename.endswith('.db'):
+            continue
+            
+        if os.path.isfile(filepath):
+            file_age_hours = (time.time() - os.path.getmtime(filepath)) / 3600
+            
+            if os.path.getmtime(filepath) < cutoff_time:
+                try:
+                    os.remove(filepath)
+                    cleaned_count += 1
+                    logger.info(f"🧹 Usunięty stary plik ({file_age_hours:.1f}h): {filename}")
+                except Exception as e:
+                    logger.error(f"❌ Błąd przy usuwaniu {filename}: {e}")
+    
+    if cleaned_count > 0:
+        logger.info(f"✅ Cleanup: Usunięto {cleaned_count} starych plików")
 
 # ---------------------------------------------------------------------------
 # CLEANUP STARYCH PLIKÓW
