@@ -1,0 +1,14 @@
+# Klucze i konfiguracja
+.env
+*.env
+
+# Pliki tymczasowe Pythona
+__pycache__/
+*.pyc
+*.pyo
+
+# Foldery systemowe
+.DS_Store
+.venv/
+env/
+venv/
