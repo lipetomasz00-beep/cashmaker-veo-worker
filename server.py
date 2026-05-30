@@ -1480,7 +1480,11 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
             if srt_file and os.path.exists(srt_file):
                 try:
-                  NARRATION_TEMPLATES = {
+                    os.remove(srt_file)
+                except Exception as e:
+                    logger.warning(f"⚠️ Nie udało się usunąć {srt_file}: {e}")
+
+NARRATION_TEMPLATES = {
     "hook": "Większość osób traci pieniądze na złym koncie. Czy i ty?",
     "problem": "Banki promują oferty, które szybko tracą atrakcyjne warunki.",
     "rozwiązanie": "Regularne porównywanie ofert pozwala znaleźć korzystniejsze opcje i zaoszczędzić na rachunkach."
