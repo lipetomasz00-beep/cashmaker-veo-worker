@@ -1830,9 +1830,7 @@ def cleanup_old_files(hours=24):
                     logger.error(f"❌ Błąd przy usuwaniu {filename}: {e}")
     
     if cleaned_count > 0:
-        logger.info(f"✅ Cleanup: Usunięto {cleaned_count} starych plików")  os.remove(srt_file)
-                except:
-                    pass
+        logger.info(f"✅ Cleanup: Usunięto {cleaned_count} starych plików")
 
 # ---------------------------------------------------------------------------
 # CLEANUP STARYCH PLIKÓW
