@@ -167,8 +167,8 @@ def is_valid_public_url(url):
         
         return True
     except Exception:
-        return False
-
+        return False 
+        
 def validate_required_env():
     """Walidacja wymaganych zmiennych środowiskowych, kluczy API i binariów systemowych."""
     # 1. Walidacja binariów ffmpeg/ffprobe
@@ -191,8 +191,8 @@ def validate_required_env():
         
         # Walidacja Gemini
         try:
-            client = get_gemini_client()            
-            client.models.get(name=MODEL)
+            client = get_gemini_client()
+            client.models.get(name=MODEL)  # <-- POPRAWIONE WCIĘCIE
             logger.info("✅ Klucz GEMINI_API_KEY zweryfikowany pomyślnie.")
         except Exception as e:
             raise RuntimeError(f"GEMINI_API_KEY validation failed: {e}")
@@ -205,7 +205,7 @@ def validate_required_env():
         except Exception as e:
             raise RuntimeError(f"ELEVENLABS_API_KEY validation failed: {e}")
 
-        # Walidacja OpenAI
+       # Walidacja OpenAI
         try:
             from openai import OpenAI
             oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -215,7 +215,6 @@ def validate_required_env():
             raise RuntimeError(f"OPENAI_API_KEY validation failed: {e}")
     else:
         logger.info("🧪 DRY_RUN lub TESTING włączony - pomijam twardą walidację kluczy API.")
-
 def require_api_key():
     """Wymagaj poprawnego API key w nagłówku Authorization lub X-API-Key."""
     auth_header = request.headers.get("Authorization", "")
