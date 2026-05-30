@@ -11,6 +11,9 @@ import sys
 import subprocess
 import threading
 import sqlite3
+import urllib.parse
+import socket
+import shutil
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_from_directory
 from google import genai
@@ -49,6 +52,10 @@ AUTO_RETRY_ENABLED = os.getenv("AUTO_RETRY_ENABLED", "true").lower() == "true"
 AUTO_RETRY_MAX_ATTEMPTS = int(os.getenv("AUTO_RETRY_MAX_ATTEMPTS", "3"))
 AUTO_RETRY_INITIAL_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_INITIAL_DELAY_SECONDS", "30"))
 AUTO_RETRY_MAX_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_MAX_DELAY_SECONDS", "600"))  # 10 minutes
+
+# Hard execution timeout configuration for background jobs
+MAX_JOB_DURATION_SECONDS = int(os.getenv("MAX_JOB_DURATION_SECONDS", "600"))  # 10 minutes
+IS_TESTING = os.getenv("TESTING", "false").lower() == "true"
 
 RATE_LIMIT_WINDOW = {}
 RATE_LIMIT_LOCK = threading.Lock()
@@ -97,14 +104,117 @@ ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
 if not ELEVENLABS_API_KEY:
     logger.warning("⚠️ ELEVENLABS_API_KEY not set!")
 
+def is_valid_public_url(url):
+    """
+    Walidacja URL-a w celu ochrony przed SSRF.
+    Zezwala tylko na publiczne adresy HTTP/HTTPS.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        
+        # Podczas testów automatycznych ignorujemy fizyczną rezolucję DNS (może nie być dostępna w piaskownicy)
+        if IS_TESTING:
+            if host in ("localhost", "127.0.0.1", "169.254.169.254"):
+                return False
+            if host.startswith("10.") or host.startswith("192.168."):
+                return False
+            if host.startswith("172."):
+                parts = host.split('.')
+                if len(parts) >= 2 and parts[0] == "172":
+                    try:
+                        second = int(parts[1])
+                        if 16 <= second <= 31:
+                            return False
+                    except ValueError:
+                        pass
+            return True
+
+        # Sprawdź czy host nie jest adresem IP i czy nie wskazuje na localhost/prywatną podsieć
+        try:
+            ip = socket.gethostbyname(host)
+        except socket.gaierror:
+            return False
+
+        # Wykluczenie adresów lokalnych i prywatnych
+        parts = list(map(int, ip.split('.')))
+        if len(parts) != 4:
+            return False
+        # 127.0.0.1
+        if parts[0] == 127:
+            return False
+        # Klasa A prywatna: 10.0.0.0/8
+        if parts[0] == 10:
+            return False
+        # Klasa B prywatna: 172.16.0.0/12
+        if parts[0] == 172 and (16 <= parts[1] <= 31):
+            return False
+        # Klasa C prywatna: 192.168.0.0/16
+        if parts[0] == 192 and parts[1] == 168:
+            return False
+        # Link-local / metadata (169.254.x.x)
+        if parts[0] == 169 and parts[1] == 254:
+            return False
+        # Multicast/Broadcast/Unspecified
+        if parts[0] >= 224:
+            return False
+        
+        return True
+    except Exception:
+        return False
+
 def validate_required_env():
-    """Walidacja wymaganych zmiennych środowiskowych przy starcie."""
+    """Walidacja wymaganych zmiennych środowiskowych, kluczy API i binariów systemowych."""
+    # 1. Walidacja binariów ffmpeg/ffprobe
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("System dependency 'ffmpeg' is missing from PATH. Install it first.")
+    if not shutil.which("ffprobe"):
+        raise RuntimeError("System dependency 'ffprobe' is missing from PATH. Install it first.")
+
+    # 2. Walidacja obecności wymaganych zmiennych
     required = ["GEMINI_API_KEY", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         raise RuntimeError(
             "Missing required environment variables: " + ", ".join(sorted(missing))
         )
+
+    # 3. Twarda walidacja kluczy przy starcie (tylko gdy nie jest to DRY_RUN / TESTING)
+    if not ENABLE_DRY_RUN and not IS_TESTING:
+        logger.info("🔒 Rozpoczynam twardą walidację kluczy API...")
+        
+        # Walidacja Gemini
+        try:
+            client = get_gemini_client()
+            client.models.get_model(model=MODEL)
+            logger.info("✅ Klucz GEMINI_API_KEY zweryfikowany pomyślnie.")
+        except Exception as e:
+            raise RuntimeError(f"GEMINI_API_KEY validation failed: {e}")
+
+        # Walidacja ElevenLabs
+        try:
+            el_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+            el_client.voices.get_all()
+            logger.info("✅ Klucz ELEVENLABS_API_KEY zweryfikowany pomyślnie.")
+        except Exception as e:
+            raise RuntimeError(f"ELEVENLABS_API_KEY validation failed: {e}")
+
+        # Walidacja OpenAI
+        try:
+            from openai import OpenAI
+            oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            oa_client.models.list()
+            logger.info("✅ Klucz OPENAI_API_KEY zweryfikowany pomyślnie.")
+        except Exception as e:
+            raise RuntimeError(f"OPENAI_API_KEY validation failed: {e}")
+    else:
+        logger.info("🧪 DRY_RUN lub TESTING włączony - pomijam twardą walidację kluczy API.")
 
 def require_api_key():
     """Wymagaj poprawnego API key w nagłówku Authorization lub X-API-Key."""
@@ -220,6 +330,12 @@ def validate_request_limits(data):
                 return jsonify({"error": "Each hashtag must start with #"}), 400
             if " " in tag:
                 return jsonify({"error": "Hashtags cannot contain spaces"}), 400
+
+    webhook_url = data.get("webhookUrl")
+    if webhook_url:
+        if not is_valid_public_url(webhook_url):
+            return jsonify({"error": "Invalid or unsafe 'webhookUrl' (SSRF protection)"}), 400
+
     return None
 
 def build_hashtags(topic, narration_texts=None, max_count=8):
@@ -308,22 +424,7 @@ def init_db():
     """Inicjalizacja tabeli historii renderów"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS renders (
-        job_id TEXT PRIMARY KEY,
-        topic TEXT,
-        status TEXT,
-        video_url TEXT,
-        error TEXT,
-        video_duration REAL,
-        created_at TIMESTAMP,
-        completed_at TIMESTAMP,
-        current_stage TEXT,
-        checkpoint_data TEXT,
-        paused_at TIMESTAMP,
-        paused_reason TEXT,
-        retry_count INTEGER DEFAULT 0,
-        next_retry_at TIMESTAMP
-    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS renders (\n        job_id TEXT PRIMARY KEY,\n        topic TEXT,\n        status TEXT,\n        video_url TEXT,\n        error TEXT,\n        video_duration REAL,\n        created_at TIMESTAMP,\n        completed_at TIMESTAMP,\n        current_stage TEXT,\n        checkpoint_data TEXT,\n        paused_at TIMESTAMP,\n        paused_reason TEXT,\n        retry_count INTEGER DEFAULT 0,\n        next_retry_at TIMESTAMP\n    )''')
     # Migrate existing databases that are missing the checkpoint columns
     existing_cols = {row[1] for row in c.execute("PRAGMA table_info(renders)")}
     for col, col_def in [
@@ -357,6 +458,7 @@ def ensure_retry_columns():
     conn.commit()
     conn.close()
 
+# Initialize Database
 init_db()
 ensure_retry_columns()
 
@@ -395,6 +497,20 @@ def call_gemini_with_cache(prompt, cache_key_prefix, max_retries=2):
 
     raise RuntimeError("Gemini API failed after retries")
 
+def generate_audio_with_elevenlabs(text, voice_id="pNInz6obpgDQGcFmaJgB"):
+    """Helper do generowania audio z ElevenLabs."""
+    client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+    response = client.text_to_speech.convert(
+        text=text,
+        voice_id=voice_id,
+        model_id="eleven_multilingual_v2"
+    )
+    audio_data = b""
+    for chunk in response:
+        if chunk:
+            audio_data += chunk
+    return audio_data
+
 def call_elevenlabs_with_cache(text, voice_id, cache_key_prefix, max_retries=2):
     """Call ElevenLabs API with caching to minimize costs."""
     cache_key = f"elevenlabs:{cache_key_prefix}:{hash(text) % 10000}"
@@ -430,18 +546,7 @@ def save_render_to_db(job_id, topic, status, video_url=None, error=None, video_d
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     completed_at = datetime.utcnow() if status in ['success', 'failed'] else None
-    c.execute('''INSERT OR REPLACE INTO renders 
-                 (job_id, topic, status, video_url, error, video_duration, created_at, completed_at,
-                  current_stage, checkpoint_data, paused_at, paused_reason) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?,
-                  COALESCE((SELECT current_stage  FROM renders WHERE job_id = ?), NULL),
-                  COALESCE((SELECT checkpoint_data FROM renders WHERE job_id = ?), NULL),
-                  COALESCE((SELECT paused_at       FROM renders WHERE job_id = ?), NULL),
-                  COALESCE((SELECT paused_reason   FROM renders WHERE job_id = ?), NULL))''',
-              (job_id, topic, status, video_url, error, video_duration, datetime.utcnow(), completed_at,
-               job_id, job_id, job_id, job_id))
-    conn.commit()
-    conn.close()
+    c.execute('''INSERT OR REPLACE INTO renders \n                 (job_id, topic, status, video_url, error, video_duration, created_at, completed_at,\n                  current_stage, checkpoint_data, paused_at, paused_reason) \n                 VALUES (?, ?, ?, ?, ?, ?, ?, ?,\n                  COALESCE((SELECT current_stage  FROM renders WHERE job_id = ?), NULL),\n                  COALESCE((SELECT checkpoint_data FROM renders WHERE job_id = ?), NULL),\n                  COALESCE((SELECT paused_at       FROM renders WHERE job_id = ?), NULL),\n                  COALESCE((SELECT paused_reason   FROM renders WHERE job_id = ?), NULL))''',\n              (job_id, topic, status, video_url, error, video_duration, datetime.utcnow(), completed_at,\n               job_id, job_id, job_id, job_id))\n    conn.commit()\n    conn.close()
 
 def save_checkpoint(job_id, stage, data=None, error=None):
     """Save a checkpoint so the job can be resumed from this stage on error."""
@@ -468,25 +573,10 @@ def save_checkpoint(job_id, stage, data=None, error=None):
             logger.warning(f"❌ Job {job_id} exceeded max retry attempts ({AUTO_RETRY_MAX_ATTEMPTS})")
 
         # Job hit an error – pause it
-        c.execute('''UPDATE renders
-                     SET current_stage   = ?,
-                         checkpoint_data = ?,
-                         paused_at       = ?,
-                         paused_reason   = ?,
-                         status          = 'paused',
-                         retry_count     = ?,
-                         next_retry_at   = ?
-                     WHERE job_id = ?''',
-                  (stage, checkpoint_json, datetime.utcnow(), error, current_retry_count, next_retry_time, job_id))
+        c.execute('''UPDATE renders\n                     SET current_stage   = ?,\n                         checkpoint_data = ?,\n                         paused_at       = ?,\n                         paused_reason   = ?,\n                         status          = 'paused',\n                         retry_count     = ?,\n                         next_retry_at   = ?\n                     WHERE job_id = ?''',\n                  (stage, checkpoint_json, datetime.utcnow(), error, current_retry_count, next_retry_time, job_id))
     else:
         # Successful stage – save progress
-        c.execute('''UPDATE renders
-                     SET current_stage   = ?,
-                         checkpoint_data = ?,
-                         retry_count     = 0,
-                         next_retry_at   = NULL
-                     WHERE job_id = ?''',
-                  (stage, checkpoint_json, job_id))
+        c.execute('''UPDATE renders\n                     SET current_stage   = ?,\n                         checkpoint_data = ?,\n                         retry_count     = 0,\n                         next_retry_at   = NULL\n                     WHERE job_id = ?''',\n                  (stage, checkpoint_json, job_id))
 
     conn.commit()
     conn.close()
@@ -496,9 +586,7 @@ def get_checkpoint(job_id):
     """Return checkpoint info for a paused job, or None if not found / not paused."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''SELECT current_stage, checkpoint_data, paused_at, paused_reason, status, topic,
-                        retry_count, next_retry_at
-                 FROM renders WHERE job_id = ?''', (job_id,))
+    c.execute('''SELECT current_stage, checkpoint_data, paused_at, paused_reason, status, topic,\n                        retry_count, next_retry_at\n                 FROM renders WHERE job_id = ?''', (job_id,))
     row = c.fetchone()
     conn.close()
     if not row:
@@ -518,10 +606,7 @@ def get_render_from_db(job_id):
     """Pobranie statusu renderowania z bazy"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''SELECT job_id, topic, status, video_url, error, video_duration,
-                        created_at, completed_at, current_stage, checkpoint_data,
-                        paused_at, paused_reason, retry_count, next_retry_at
-                 FROM renders WHERE job_id = ?''', (job_id,))
+    c.execute('''SELECT job_id, topic, status, video_url, error, video_duration,\n                        created_at, completed_at, current_stage, checkpoint_data,\n                        paused_at, paused_reason, retry_count, next_retry_at\n                 FROM renders WHERE job_id = ?''', (job_id,))
     row = c.fetchone()
     conn.close()
 
@@ -631,15 +716,12 @@ def generate_audio_narration(narration_texts, job_id):
         logger.error("❌ ElevenLabs API key not configured!")
         raise ValueError("ELEVENLABS_API_KEY not set")
 
-    # Inicjalizacja klienta raz, przed pętlą
     client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
     audio_files = {}
 
     for scene_key, text in narration_texts.items():
-        # Ustal ścieżkę pliku
         audio_file = os.path.join(tempfile.gettempdir(), f"narration_{scene_key}_{job_id}.mp3")
 
-        # --- CHECKPOINT: Jeśli plik istnieje, nie wołaj API ---
         if os.path.exists(audio_file):
             logger.info(f"⏩ Lektor {scene_key} już istnieje. Pomijam ElevenLabs.")
             duration = get_audio_duration(audio_file)
@@ -648,13 +730,11 @@ def generate_audio_narration(narration_texts, job_id):
                 "duration": duration,
                 "text": text
             }
-            continue # Przejdź do następnej sceny
+            continue
 
         logger.info(f"🎙️ Generowanie lektora: {scene_key} ({len(text)} znaków)")
 
         try:
-            # Nowe ElevenLabs zwraca strumień danych (generator), a nie gotowy plik
-            # Try new API first, fallback to helper function
             audio_stream = None
             try:
                 logger.info(f"🎙️ Trying text_to_speech.convert()...")
@@ -682,7 +762,6 @@ def generate_audio_narration(narration_texts, job_id):
                     logger.error(f"❌ Both methods failed: convert={e1}, generate={e2}")
                     raise e2
             
-            # Bezpieczny zapis strumienia w kawałkach (chunkach) do pliku MP3
             with open(audio_file, "wb") as f:
                 for chunk in audio_stream:
                     if chunk:
@@ -691,7 +770,6 @@ def generate_audio_narration(narration_texts, job_id):
             logger.info(f"✅ Lektor dla {scene_key} zapisany pomyślnie.")
             duration = get_audio_duration(audio_file)
             
-            # Dodanie informacji o zapisanym pliku do słownika
             audio_files[scene_key] = {
                 "path": audio_file,
                 "duration": duration,
@@ -700,11 +778,10 @@ def generate_audio_narration(narration_texts, job_id):
 
         except Exception as e:
             logger.error(f"❌ Błąd generowania lektora dla {scene_key}: {e}")
-            # Rzucamy błąd dalej - jeśli lektor padł, nie ma sensu renderować wideo bez dźwięku
             raise 
 
-    # TEN RETURN JEST KLUCZOWY - oddaje dane do dalszego montażu
     return audio_files
+
 # ---------------------------------------------------------------------------
 # NAPISY: GENEROWANIE SRT Z AUDIO (Whisper API)
 # ---------------------------------------------------------------------------
@@ -718,14 +795,13 @@ def generate_subtitles_from_audio(audio_file, job_id):
     try:
         logger.info(f"📝 Transkrypcja audio (Whisper API)...")
         
-        # OpenAI Whisper API
-        import openai
-        openai.api_key = os.getenv("OPENAI_API_KEY")
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         
         with open(audio_file, "rb") as f:
-            transcript = retry_with_backoff(
+            transcript_obj = retry_with_backoff(
                 "Whisper transcribe",
-                lambda: openai.Audio.transcribe(
+                lambda: client.audio.transcriptions.create(
                     model="whisper-1",
                     file=f,
                     language="pl",  # Polski
@@ -733,7 +809,13 @@ def generate_subtitles_from_audio(audio_file, job_id):
                 )
             )
         
-        # Generowanie SRT z segmentów (timestamps)
+        if hasattr(transcript_obj, "model_dump"):
+            transcript = transcript_obj.model_dump()
+        elif hasattr(transcript_obj, "dict"):
+            transcript = transcript_obj.dict()
+        else:
+            transcript = transcript_obj
+
         srt_content = ""
         srt_index = 1
         
@@ -748,7 +830,6 @@ def generate_subtitles_from_audio(audio_file, job_id):
                 srt_content += f"{text}\n\n"
                 srt_index += 1
         
-        # Zapis SRT
         srt_path = os.path.join(tempfile.gettempdir(), f"subs_{job_id}.srt")
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
@@ -789,24 +870,20 @@ def generate_end_screen(job_id, topic, output_path):
     width, height = 1080, 1920
     background_color = (10, 25, 50)  # Dark blue
     
-    # Tworzenie obrazu
     img = Image.new('RGB', (width, height), background_color)
     draw = ImageDraw.Draw(img)
     
-    # Tytuł (temat)
     try:
         title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 80)
     except:
         title_font = ImageFont.load_default()
     
-    # Tekst CTA
     try:
         cta_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 50)
     except:
         cta_font = ImageFont.load_default()
     
-    # Rysowanie tekstu
-    title_text = topic[:30]  # Limit tekstu
+    title_text = topic[:30]
     draw.text((540, 800), title_text, fill=(255, 255, 255), font=title_font, anchor="mm")
     
     cta_text = "Sprawdź raport na:"
@@ -815,12 +892,10 @@ def generate_end_screen(job_id, topic, output_path):
     draw.text((540, 1400), cta_text, fill=(200, 200, 200), font=cta_font, anchor="mm")
     draw.text((540, 1550), domain_text, fill=(0, 200, 100), font=cta_font, anchor="mm")
     
-    # Zapis PNG
     img_path = os.path.join(tempfile.gettempdir(), f"endscreen_{job_id}.png")
     img.save(img_path)
     logger.info(f"✅ Plansza PNG: {img_path}")
     
-    # Konwersja PNG → MP4 (3 sekundy trwania)
     ffmpeg_cmd = [
         'ffmpeg', '-y',
         '-loop', '1', '-i', img_path,
@@ -829,10 +904,9 @@ def generate_end_screen(job_id, topic, output_path):
         output_path
     ]
     
-    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
     logger.info(f"✅ Plansza MP4: {output_path}")
     
-    # Cleanup
     if os.path.exists(img_path):
         os.remove(img_path)
     
@@ -845,12 +919,9 @@ def generate_end_screen(job_id, topic, output_path):
 def add_watermark(video_path, output_path, watermark_text="raport-finansowy24.pl", opacity=0.7):
     """
     Dodanie watermarku tekstowego do wideo
-    
-    Watermark będzie w dolnym rogu przez całe wideo
     """
     logger.info(f"🏷️ Dodawanie watermarku: {watermark_text}")
     
-    # FFmpeg drawtext filter z przezroczystością
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-i', video_path,
         '-vf', (
@@ -864,7 +935,7 @@ def add_watermark(video_path, output_path, watermark_text="raport-finansowy24.pl
         output_path
     ]
     
-    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
     logger.info(f"✅ Watermark dodany")
     
     return output_path
@@ -953,7 +1024,7 @@ def generate_video_with_speed_adjustment(segment_files, speed=1.0):
         ]
         
         logger.info(f"  ⏱️ Segment {i}: {speed:.2f}x")
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         
         speed_adjusted_files.append(output_file)
     
@@ -968,7 +1039,6 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
     Łączenie segmentów wideo + dodanie lektora + napisy + watermark
     """
     
-    # 1. PRZYGOTOWANIE LISTY WIDEO DO CONCAT
     list_file_path = os.path.join(tempfile.gettempdir(), f"list_{job_id}.txt")
     with open(list_file_path, "w") as f:
         for video_file in video_files:
@@ -982,10 +1052,9 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
         '-c', 'copy',
         concat_output
     ]
-    subprocess.run(ffmpeg_concat_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(ffmpeg_concat_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
     logger.info(f"✅ Wideo połączone: {concat_output}")
     
-    # 2. PRZYGOTOWANIE AUDIO (wszystkie lektory)
     logger.info("🎙️ Etap 2: Miksowanie audio (lektory)...")
     
     combined_audio = os.path.join(tempfile.gettempdir(), f"combined_audio_{job_id}.mp3")
@@ -1001,23 +1070,18 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
         '-c:a', 'libmp3lame', '-q:a', '4',
         combined_audio
     ]
-    subprocess.run(ffmpeg_audio_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(ffmpeg_audio_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
     logger.info(f"✅ Lektory połączone: {combined_audio}")
     
-    # 3. OSTATECZNE MIKSOWANIE: WIDEO + AUDIO + SRT + WATERMARK
     logger.info("🎨 Etap 3: Miksowanie wideo + audio + napisy...")
     
-    # Budowanie filtrów
     video_filter = f"[0:v]setpts=PTS/{speed}"
     
-    # Dodaj napisy (jeśli istnieją)
     if srt_file and os.path.exists(srt_file):
-        # Escape ścieżki dla FFmpeg
         srt_path_escaped = srt_file.replace("\\", "\\\\").replace(":", "\\:")
         video_filter += f",subtitles='{srt_path_escaped}':force_style='FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&'"
         logger.info(f"✅ Napisy będą wypalane")
     
-    # Dodaj watermark
     watermark_text = "raport-finansowy24.pl"
     video_filter += f",drawtext=text='{watermark_text}':x=w-text_w-20:y=h-text_h-20:fontsize=24:fontcolor=white@0.7:box=1:boxcolor=black@0.5"
     
@@ -1036,10 +1100,9 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
     ]
     
     logger.info("🔄 Kodowanie finale (może potrwać trochę)...")
-    subprocess.run(ffmpeg_final_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(ffmpeg_final_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
     logger.info(f"✅ Finalne wideo: {output_path}")
     
-    # Cleanup
     for file in [list_file_path, audio_list_file, concat_output, combined_audio]:
         if os.path.exists(file):
             try:
@@ -1062,16 +1125,7 @@ NARRATION_TEMPLATES = {
 def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=None):
     """
     Główny proces montażu sekwencji - uruchamiany w tle
-
-    Schemat:
-    Temat → HOOK/PROBLEM/ROZWIĄZANIE → Veo → Lektor → Dopasowanie →
-    Napisy → Watermark → Plansza końcowa → Gotowy short
-
-    Parametry:
-        resume_from  – nazwa etapu (current_stage) od którego wznowić pracę,
-                       lub None gdy start od początku.
     """
-    # Ordered list of stage names used for skip-logic on resume
     STAGES = [
         "hook_video",
         "problem_video",
@@ -1090,6 +1144,11 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         except ValueError:
             return False
 
+    job_start_time = time.time()
+    def check_job_timeout():
+        if time.time() - job_start_time > MAX_JOB_DURATION_SECONDS:
+            raise TimeoutError(f"Job exceeded the maximum execution limit of {MAX_JOB_DURATION_SECONDS} seconds.")
+
     segment_files = []
     audio_files_dict = {}
     srt_file = None
@@ -1097,6 +1156,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
     job_paused = False
 
     try:
+        check_job_timeout()
         client = get_gemini_client()
         topic = raw_data.get("topic", "Finanse osobiste")
         raw_data = apply_optimization_rules(raw_data, topic)
@@ -1141,9 +1201,6 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             METRICS["jobs_success"] += 1
             return
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 1: SZABLON MARKETINGOWY
-        # ═══════════════════════════════════════════════════════════════
         prompts = {
             "hook": f"Dynamic cinematic shot, extreme close up, shock and stress, concept of {topic}, corporate finance style, 4k, professional",
             "problem": f"A person looking anxiously at bills and charts on a screen, dark moody lighting, financial stress, 4k, professional",
@@ -1152,10 +1209,6 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
         logger.info("📋 Szablon: HOOK → PROBLEM → ROZWIĄZANIE")
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 2: GENEROWANIE 3 KLIPÓW VEO
-        # Each clip has its own stage name so we can resume mid-way.
-        # ═══════════════════════════════════════════════════════════════
         stage_map = {
             "hook":       "hook_video",
             "problem":    "problem_video",
@@ -1163,16 +1216,15 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         }
 
         for key, prompt_text in prompts.items():
+            check_job_timeout()
             stage_name = stage_map[key]
 
-            # On resume: if this clip was already generated, try to reuse it
             if _stage_done(stage_name):
                 cached_path = os.path.join(tempfile.gettempdir(), f"seg_{job_id}_{key}.mp4")
                 if os.path.exists(cached_path):
                     logger.info(f"⏩ Scena {key.upper()} już istnieje – pomijam Veo.")
                     segment_files.append(cached_path)
                     continue
-                # File was lost – regenerate it
                 logger.info(f"⚠️  Plik sceny {key} zaginął – regeneruję...")
 
             current_stage = stage_name
@@ -1180,7 +1232,6 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             logger.info(f"🎥 Generowanie sceny: {key.upper()}")
             file_path = generate_video_segment(client, prompt_text, aspect_ratio)
 
-            # Persist with a stable name so resume can find it
             stable_path = os.path.join(tempfile.gettempdir(), f"seg_{job_id}_{key}.mp4")
             import shutil
             shutil.copy2(file_path, stable_path)
@@ -1191,9 +1242,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
         logger.info(f"✅ Wszystkie 3 sceny gotowe")
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 3: GENEROWANIE LEKTORA (ElevenLabs)
-        # ═══════════════════════════════════════════════════════════════
+        check_job_timeout()
         if not _stage_done("narration"):
             current_stage = "narration"
             save_checkpoint(job_id, current_stage, data={"topic": topic})
@@ -1203,9 +1252,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         audio_files_dict = generate_audio_narration(narration_texts, job_id)
         logger.info(f"✅ Lektor wygenerowany")
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 4: GENEROWANIE NAPISÓW Z AUDIO (Whisper API)
-        # ═══════════════════════════════════════════════════════════════
+        check_job_timeout()
         srt_file = None
         try:
             combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
@@ -1221,7 +1268,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
                 '-c:a', 'libmp3lame', '-q:a', '4',
                 combined_for_transcription
             ]
-            subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
 
             srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
 
@@ -1234,9 +1281,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             logger.warning(f"⚠️ Napisy niedostępne: {e}")
             srt_file = None
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 5: AUTOMATYCZNE DOPASOWANIE DŁUGOŚCI
-        # ═══════════════════════════════════════════════════════════════
+        check_job_timeout()
         logger.info("⏱️ Etap automatycznego dopasowania długości...")
 
         target_duration = int(raw_data.get("targetDuration", 15))
@@ -1247,9 +1292,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             segment_files = generate_video_with_speed_adjustment(segment_files, speed)
             logger.info(f"✅ Segmenty dopasowane")
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 6: GŁÓWNY MONTAŻ (WIDEO + AUDIO + NAPISY + WATERMARK)
-        # ═══════════════════════════════════════════════════════════════
+        check_job_timeout()
         current_stage = "assembly"
         save_checkpoint(job_id, current_stage, data={"topic": topic, "speed": speed})
         logger.info("🎬 Główny montaż (wideo + audio + napisy + watermark)...")
@@ -1259,9 +1302,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
         concat_video_with_audio_and_subtitles(segment_files, audio_files_dict, srt_file, job_id, final_output_path, speed)
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 7: DODANIE PLANSZY KOŃCOWEJ
-        # ═══════════════════════════════════════════════════════════════
+        check_job_timeout()
         logger.info("🎨 Dodawanie planszy końcowej...")
 
         endscreen_path = os.path.join(tempfile.gettempdir(), f"endscreen_{job_id}.mp4")
@@ -1279,7 +1320,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             '-c', 'copy',
             final_with_endscreen
         ]
-        subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
 
         os.replace(final_with_endscreen, final_output_path)
         logger.info(f"✅ Plansza końcowa dodana")
@@ -1291,9 +1332,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
                 except:
                     pass
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 8: POMIAR CZASU TRWANIA
-        # ═══════════════════════════════════════════════════════════════
+        check_job_timeout()
         video_duration = get_video_duration(final_output_path)
         file_size_mb = os.path.getsize(final_output_path) / (1024 * 1024)
         if file_size_mb > MAX_OUTPUT_VIDEO_MB:
@@ -1309,17 +1348,11 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         video_url = f"https://{host}/videos/{final_filename}"
         logger.info(f"📺 URL: {video_url}")
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 9: UPLOAD / AKTUALIZACJA BAZY DANYCH
-        # ═══════════════════════════════════════════════════════════════
         current_stage = "upload"
         save_checkpoint(job_id, current_stage, data={"video_url": video_url})
         save_render_to_db(job_id, topic, 'success', video_url, video_duration=video_duration)
         logger.info(f"💾 Historia zapisana")
 
-        # ═══════════════════════════════════════════════════════════════
-        # KROK 10: WEBHOOK
-        # ═══════════════════════════════════════════════════════════════
         if webhook_url:
             logger.info(f"🔔 Wysyłanie webhook...")
             try:
@@ -1352,7 +1385,6 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         METRICS["jobs_failed"] += 1
         METRICS["last_error"] = str(e)
 
-        # ── PAUSE instead of fail ──────────────────────────────────────
         job_paused = True
         save_checkpoint(job_id, current_stage, error=str(e))
         logger.error(f"⏸️ Job {job_id} PAUSED at '{current_stage}': {e}")
@@ -1376,9 +1408,6 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
     finally:
         RENDER_SEMAPHORE.release()
-        # ═══════════════════════════════════════════════════════════════
-        # CLEANUP – skip temp files when paused so resume can reuse them
-        # ═══════════════════════════════════════════════════════════════
         if job_paused:
             logger.info("⏸️ Job paused – zachowuję pliki tymczasowe dla wznowienia.")
         else:
@@ -1441,13 +1470,6 @@ def cleanup_old_files(hours=24):
 def start_render_sequence():
     """
     POST /render-sequence
-    
-    Body:
-    {
-        "topic": "Porównanie kont bankowych",
-        "narration": {...},
-        "webhookUrl": "https://example.com/webhook"
-    }
     """
     auth_error = require_api_key()
     if auth_error:
@@ -1458,7 +1480,6 @@ def start_render_sequence():
     if limits_error:
         return limits_error
 
-        # Free-tier rate limit per API key
     ok, retry_after = enforce_rate_limit(WORKER_API_KEY or "default")
     if not ok:
         return jsonify({
@@ -1554,10 +1575,6 @@ def get_task_status(task_id):
 def resume_job(job_id):
     """
     POST /resume/<job_id>
-    Headers: X-API-Key
-
-    Resumes a paused job from the checkpoint stage where it stopped.
-    Returns 409 if the job is not in 'paused' state.
     """
     auth_error = require_api_key()
     if auth_error:
@@ -1584,7 +1601,6 @@ def resume_job(job_id):
     resume_from = checkpoint["current_stage"]
     topic = checkpoint["topic"]
 
-    # Rebuild raw_data from checkpoint + any overrides supplied in the request body
     override_data = request.json or {}
     raw_data = {
         "topic": topic,
@@ -1592,11 +1608,10 @@ def resume_job(job_id):
         **checkpoint["checkpoint_data"],
         **override_data,
     }
-    raw_data["host"] = request.host  # always use current host
+    raw_data["host"] = request.host
 
     webhook_url = raw_data.get("webhookUrl")
 
-    # Mark job as processing again before spawning the thread
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE renders SET status = 'processing' WHERE job_id = ?", (job_id,))
@@ -1634,15 +1649,8 @@ def auto_retry_worker():
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
 
-            # Find jobs that are paused and ready to retry
             now = datetime.utcnow()
-            c.execute('''SELECT job_id, topic, checkpoint_data, current_stage, retry_count
-                         FROM renders
-                         WHERE status = 'paused'
-                         AND next_retry_at IS NOT NULL
-                         AND next_retry_at <= ?
-                         AND retry_count <= ?''',
-                      (now, AUTO_RETRY_MAX_ATTEMPTS))
+            c.execute('''SELECT job_id, topic, checkpoint_data, current_stage, retry_count\n                         FROM renders\n                         WHERE status = 'paused'\n                         AND next_retry_at IS NOT NULL\n                         AND next_retry_at <= ?\n                         AND retry_count <= ?''',\n                      (now, AUTO_RETRY_MAX_ATTEMPTS))
 
             jobs_to_retry = c.fetchall()
             conn.close()
@@ -1653,30 +1661,21 @@ def auto_retry_worker():
                 try:
                     checkpoint = json.loads(checkpoint_json) if checkpoint_json else {}
 
-                    # Acquire semaphore
                     if not RENDER_SEMAPHORE.acquire(blocking=False):
                         logger.warning(f"⚠️  Cannot retry {job_id}: too many concurrent renders")
                         continue
 
-                    # Update status to processing
                     conn = sqlite3.connect(DB_PATH)
                     c = conn.cursor()
-                    c.execute('''UPDATE renders
-                                 SET status = 'processing',
-                                     paused_at = NULL,
-                                     paused_reason = NULL,
-                                     next_retry_at = NULL
-                                 WHERE job_id = ?''', (job_id,))
+                    c.execute('''UPDATE renders\n                                 SET status = 'processing',\n                                     paused_at = NULL,\n                                     paused_reason = NULL,\n                                     next_retry_at = NULL\n                                 WHERE job_id = ?''', (job_id,))
                     conn.commit()
                     conn.close()
 
-                    # Rebuild raw_data from checkpoint
                     raw_data = {
                         "topic": topic,
                         **checkpoint
                     }
 
-                    # Start render thread
                     thread = threading.Thread(
                         target=render_sequence_background,
                         args=(job_id, raw_data, None),
@@ -1689,7 +1688,6 @@ def auto_retry_worker():
                     logger.error(f"❌ Failed to auto-retry job {job_id}: {e}")
                     RENDER_SEMAPHORE.release()
 
-            # Check every 30 seconds
             time.sleep(30)
 
         except Exception as e:
@@ -1758,9 +1756,18 @@ def index():
         ]
     }), 200
 
+# ---------------------------------------------------------------------------
+# STARTUP WALIDACJA (Gdy moduł jest importowany przez Gunicorn lub uruchamiany bezpośrednio)
+# ---------------------------------------------------------------------------
+try:
+    validate_required_env()
+    logger.info("✅ Startup validation passed successfully.")
+except Exception as val_err:
+    logger.error(f"❌ Startup validation failed: {val_err}")
+    if not IS_TESTING and not ENABLE_DRY_RUN:
+        sys.exit(1)
 
 if __name__ == "__main__":
-    validate_required_env()
     logger.info("🚀 Startup VeoVideo API v3.1 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
     logger.info(f"📁 Storage: {STORAGE_DIR}")
     logger.info(f"🗄️  Database: {DB_PATH}")
