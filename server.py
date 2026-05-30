@@ -584,10 +584,25 @@ def save_checkpoint(job_id, stage, data=None, error=None):
             logger.warning(f"❌ Job {job_id} exceeded max retry attempts ({AUTO_RETRY_MAX_ATTEMPTS})")
 
         # Job hit an error – pause it
-        c.execute('''UPDATE renders\n                     SET current_stage   = ?,\n                         checkpoint_data = ?,\n                         paused_at       = ?,\n                         paused_reason   = ?,\n                         status          = 'paused',\n                         retry_count     = ?,\n                         next_retry_at   = ?\n                     WHERE job_id = ?''',\n                  (stage, checkpoint_json, datetime.utcnow(), error, current_retry_count, next_retry_time, job_id))
+        c.execute('''UPDATE renders
+                     SET current_stage   = ?,
+                         checkpoint_data = ?,
+                         paused_at       = ?,
+                         paused_reason   = ?,
+                         status          = 'paused',
+                         retry_count     = ?,
+                         next_retry_at   = ?
+                     WHERE job_id = ?''',
+                  (stage, checkpoint_json, datetime.utcnow(), error, current_retry_count, next_retry_time, job_id))
     else:
         # Successful stage – save progress
-        c.execute('''UPDATE renders\n                     SET current_stage   = ?,\n                         checkpoint_data = ?,\n                         retry_count     = 0,\n                         next_retry_at   = NULL\n                     WHERE job_id = ?''',\n                  (stage, checkpoint_json, job_id))
+        c.execute('''UPDATE renders
+                     SET current_stage   = ?,
+                         checkpoint_data = ?,
+                         retry_count     = 0,
+                         next_retry_at   = NULL
+                     WHERE job_id = ?''',
+                  (stage, checkpoint_json, job_id))
 
     conn.commit()
     conn.close()
@@ -597,7 +612,9 @@ def get_checkpoint(job_id):
     """Return checkpoint info for a paused job, or None if not found / not paused."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''SELECT current_stage, checkpoint_data, paused_at, paused_reason, status, topic,\n                        retry_count, next_retry_at\n                 FROM renders WHERE job_id = ?''', (job_id,))
+    c.execute('''SELECT current_stage, checkpoint_data, paused_at, paused_reason, status, topic,
+                        retry_count, next_retry_at
+                 FROM renders WHERE job_id = ?''', (job_id,))
     row = c.fetchone()
     conn.close()
     if not row:
@@ -617,7 +634,10 @@ def get_render_from_db(job_id):
     """Pobranie statusu renderowania z bazy"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''SELECT job_id, topic, status, video_url, error, video_duration,\n                        created_at, completed_at, current_stage, checkpoint_data,\n                        paused_at, paused_reason, retry_count, next_retry_at\n                 FROM renders WHERE job_id = ?''', (job_id,))
+    c.execute('''SELECT job_id, topic, status, video_url, error, video_duration,
+                        created_at, completed_at, current_stage, checkpoint_data,
+                        paused_at, paused_reason, retry_count, next_retry_at
+                 FROM renders WHERE job_id = ?''', (job_id,))
     row = c.fetchone()
     conn.close()
 
@@ -1661,7 +1681,13 @@ def auto_retry_worker():
             c = conn.cursor()
 
             now = datetime.utcnow()
-            c.execute('''SELECT job_id, topic, checkpoint_data, current_stage, retry_count\n                         FROM renders\n                         WHERE status = 'paused'\n                         AND next_retry_at IS NOT NULL\n                         AND next_retry_at <= ?\n                         AND retry_count <= ?''',\n                      (now, AUTO_RETRY_MAX_ATTEMPTS))
+            c.execute('''SELECT job_id, topic, checkpoint_data, current_stage, retry_count
+                         FROM renders
+                         WHERE status = 'paused'
+                         AND next_retry_at IS NOT NULL
+                         AND next_retry_at <= ?
+                         AND retry_count <= ?''',
+                      (now, AUTO_RETRY_MAX_ATTEMPTS))
 
             jobs_to_retry = c.fetchall()
             conn.close()
@@ -1678,7 +1704,12 @@ def auto_retry_worker():
 
                     conn = sqlite3.connect(DB_PATH)
                     c = conn.cursor()
-                    c.execute('''UPDATE renders\n                                 SET status = 'processing',\n                                     paused_at = NULL,\n                                     paused_reason = NULL,\n                                     next_retry_at = NULL\n                                 WHERE job_id = ?''', (job_id,))
+                    c.execute('''UPDATE renders
+                                 SET status = 'processing',
+                                     paused_at = NULL,
+                                     paused_reason = NULL,
+                                     next_retry_at = NULL
+                                 WHERE job_id = ?''', (job_id,))
                     conn.commit()
                     conn.close()
 
