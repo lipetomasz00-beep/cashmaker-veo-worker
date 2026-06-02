@@ -179,7 +179,7 @@ def validate_required_env():
         raise RuntimeError("System dependency 'ffprobe' is missing from PATH. Install it first.")
 
     # 2. Walidacja obecności wymaganych zmiennych
-    required = ["GEMINI_API_KEY", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
+    required = ["GEMINI_API_KEY", "HF_TOKEN", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         raise RuntimeError(
@@ -214,8 +214,18 @@ def validate_required_env():
             logger.info("✅ Klucz OPENAI_API_KEY zweryfikowany pomyślnie.")
         except Exception as e:
             raise RuntimeError(f"OPENAI_API_KEY validation failed: {e}")
+
+        # Walidacja HF_TOKEN (wymagany do generowania wideo przez HunyuanVideo)
+        try:
+            hf_token = os.getenv("HF_TOKEN")
+            if not hf_token:
+                raise ValueError("HF_TOKEN is empty")
+            logger.info("✅ Klucz HF_TOKEN zweryfikowany pomyślnie.")
+        except Exception as e:
+            raise RuntimeError(f"HF_TOKEN validation failed: {e}")
     else:
         logger.info("🧪 DRY_RUN lub TESTING włączony - pomijam twardą walidację kluczy API.")
+
 def require_api_key():
     """Wymagaj poprawnego API key w nagłówku Authorization lub X-API-Key."""
     auth_header = request.headers.get("Authorization", "")
