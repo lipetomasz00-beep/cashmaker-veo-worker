@@ -32,7 +32,7 @@ sys.modules['openai'] = mock_openai
 
 # Set testing environment variables before importing server
 os.environ["TESTING"] = "true"
-os.environ["GEMINI_API_KEY"] = "dummy_gemini"
+os.environ["HF_TOKEN"] = "dummy_hf_token"
 os.environ["ELEVENLABS_API_KEY"] = "dummy_elevenlabs"
 os.environ["OPENAI_API_KEY"] = "dummy_openai"
 os.environ["WORKER_API_KEY"] = "secret_test_key"
@@ -43,7 +43,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 
-class TestVeoVideoAPI(unittest.TestCase):
+class TestHunyuanVideoAPI(unittest.TestCase):
     def setUp(self):
         server.app.config["TESTING"] = True
         self.client = server.app.test_client()
