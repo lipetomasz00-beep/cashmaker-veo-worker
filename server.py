@@ -20,6 +20,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
 from elevenlabs.client import ElevenLabs
+from gradio_client import Client
 
 # ---------------------------------------------------------------------------
 # KONFIGURACJA I INICJALIZACJA
@@ -739,6 +740,60 @@ def generate_video_segment(client, prompt, aspect_ratio="9:16"):
     temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
     download_video_with_backoff(video_uri, temp_file)
     return temp_file
+
+def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
+    """
+    Generuje segment wideo przez Gradio Client (Kijai/HunyuanVideo_wrapper Space).
+
+    Używa gradio_client zamiast surowych żądań HTTP, co pozwala na długotrwałe
+    operacje bez twardego limitu 60 sekund narzucanego przez HF Inference API.
+    """
+    logger.info(f"🎬 HunyuanVideo: generowanie segmentu via Gradio Client: {prompt[:60]}...")
+
+    hf_token = os.getenv("HF_TOKEN")
+
+    # Mapowanie aspect ratio na wymiary obsługiwane przez HunyuanVideo
+    aspect_ratio_map = {
+        "9:16":  (544, 960),
+        "16:9":  (960, 544),
+        "1:1":   (720, 720),
+        "4:3":   (832, 624),
+        "3:4":   (624, 832),
+    }
+    width, height = aspect_ratio_map.get(aspect_ratio, (544, 960))
+
+    def _call_gradio():
+        hf_client = Client("Kijai/HunyuanVideo_wrapper", hf_token=hf_token)
+        return hf_client.predict(
+            prompt=prompt,
+            negative_prompt="low quality, blurry, static, text, watermark",
+            infer_steps=30,
+            guidance_scale=6.0,
+            width=width,
+            height=height,
+            num_frames=61,
+            api_name="/generate_video",
+        )
+
+    result_path = retry_with_backoff("HunyuanVideo Gradio predict", _call_gradio)
+
+    # Gradio Client zwraca lokalną ścieżkę do wygenerowanego pliku
+    if not result_path or not os.path.exists(result_path):
+        raise RuntimeError(f"❌ HunyuanVideo: Gradio Client nie zwrócił prawidłowej ścieżki: {result_path}")
+
+    logger.info(f"✅ HunyuanVideo: plik tymczasowy gotowy: {result_path}")
+
+    # Skopiuj do docelowej ścieżki i usuń plik tymczasowy Gradio
+    with open(result_path, "rb") as src, open(output_path, "wb") as dst:
+        dst.write(src.read())
+
+    try:
+        os.remove(result_path)
+    except OSError as e:
+        logger.warning(f"⚠️ HunyuanVideo: nie udało się usunąć pliku tymczasowego {result_path}: {e}")
+
+    logger.info(f"✅ HunyuanVideo: segment zapisany do {output_path}")
+    return output_path
 
 # ---------------------------------------------------------------------------
 # AUDIO: LEKTOR (ElevenLabs)
