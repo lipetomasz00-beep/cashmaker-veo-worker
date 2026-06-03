@@ -68,6 +68,104 @@ IDEMPOTENCY_LOCK = threading.Lock()
 API_CACHE = {}
 API_CACHE_TTL_SECONDS = 3600  # 1 hour
 
+# ---------------------------------------------------------------------------
+# GEMINI API RATE LIMITER
+# Enforces Gemini free-tier quotas:
+#   RPM  : 15 requests/min  → minimum 4 s between calls
+#   RPD  : 1500 requests/day → warn when approaching limit
+# ---------------------------------------------------------------------------
+
+GEMINI_MIN_INTERVAL_SECONDS = float(os.getenv("GEMINI_MIN_INTERVAL_SECONDS", "4.0"))
+GEMINI_DAILY_QUOTA = int(os.getenv("GEMINI_DAILY_QUOTA", "1500"))
+GEMINI_DAILY_WARN_THRESHOLD = int(os.getenv("GEMINI_DAILY_WARN_THRESHOLD", "1350"))  # warn at 90 %
+
+
+class GeminiRateLimiter:
+    """
+    Thread-safe rate limiter for the Gemini API.
+
+    Enforces a minimum interval between consecutive calls (RPM quota) and
+    tracks the daily request count (RPD quota), emitting a warning when the
+    daily limit is approaching.
+    """
+
+    def __init__(self, min_interval: float = GEMINI_MIN_INTERVAL_SECONDS,
+                 daily_quota: int = GEMINI_DAILY_QUOTA,
+                 daily_warn_threshold: int = GEMINI_DAILY_WARN_THRESHOLD):
+        self._lock = threading.Lock()
+        self._min_interval = min_interval          # seconds between calls
+        self._last_call_time: float = 0.0          # epoch seconds of last call
+        self._daily_quota = daily_quota
+        self._daily_warn_threshold = daily_warn_threshold
+        self._daily_count: int = 0
+        self._day_start: datetime = datetime.utcnow().date()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def wait_for_quota(self) -> None:
+        """
+        Block until it is safe to make the next Gemini API call.
+
+        1. Resets the daily counter when the UTC date rolls over.
+        2. Logs a warning when the daily quota is 90 % consumed.
+        3. Sleeps for the remainder of the minimum inter-call interval.
+        """
+        with self._lock:
+            self._maybe_reset_daily_counter()
+            self._check_daily_quota()
+            self._enforce_rpm_throttle()
+            self._daily_count += 1
+            self._last_call_time = time.time()
+
+    @property
+    def daily_count(self) -> int:
+        with self._lock:
+            self._maybe_reset_daily_counter()
+            return self._daily_count
+
+    # ------------------------------------------------------------------
+    # Internal helpers (must be called with self._lock held)
+    # ------------------------------------------------------------------
+
+    def _maybe_reset_daily_counter(self) -> None:
+        today = datetime.utcnow().date()
+        if today != self._day_start:
+            logger.info(
+                f"📅 Gemini daily counter reset (was {self._daily_count} requests on {self._day_start})"
+            )
+            self._daily_count = 0
+            self._day_start = today
+
+    def _check_daily_quota(self) -> None:
+        if self._daily_count >= self._daily_warn_threshold:
+            remaining = self._daily_quota - self._daily_count
+            logger.warning(
+                f"⚠️  Gemini daily quota nearly exhausted: "
+                f"{self._daily_count}/{self._daily_quota} requests used today "
+                f"({remaining} remaining). Approaching RPD limit."
+            )
+
+    def _enforce_rpm_throttle(self) -> None:
+        elapsed = time.time() - self._last_call_time
+        wait_needed = self._min_interval - elapsed
+        if wait_needed > 0:
+            logger.info(
+                f"⏳ Gemini rate limiter: throttling for {wait_needed:.2f}s "
+                f"(min interval {self._min_interval}s, elapsed {elapsed:.2f}s)"
+            )
+            # Release the lock while sleeping so other threads are not blocked
+            self._lock.release()
+            try:
+                time.sleep(wait_needed)
+            finally:
+                self._lock.acquire()
+
+
+# Global singleton — shared across all threads
+gemini_rate_limiter = GeminiRateLimiter()
+
 def cache_api_response(cache_key, response_data):
     """Cache an API response with TTL."""
     API_CACHE[cache_key] = {
@@ -284,18 +382,35 @@ def remember_idempotency(idempotency_key, response_obj):
         }
 
 def retry_with_backoff(operation_name, func, max_retries=3, base_delay=2):
-    """Retry helper z exponential backoff dla wywołań zewnętrznych API."""
+    """Retry helper z exponential backoff dla wywołań zewnętrznych API.
+
+    429 RESOURCE_EXHAUSTED errors receive a longer initial wait (60 s) so that
+    the Gemini RPM window has time to refill before the next attempt.
+    """
     for attempt in range(max_retries):
         try:
             return func()
         except Exception as exc:
             retryable = _is_retryable_exception(exc)
-            wait_s = base_delay ** attempt
-            if attempt < max_retries - 1 and retryable:
+            is_quota_error = "429" in str(exc) or "resource_exhausted" in str(exc).lower()
+
+            if is_quota_error:
+                # Quota errors need a much longer back-off than generic retries.
+                # Start at 60 s and double on each subsequent attempt.
+                wait_s = 60 * (2 ** attempt)
                 logger.warning(
-                    f"⚠️ {operation_name} failed (attempt {attempt+1}/{max_retries}): {exc}. "
-                    f"Retry in {wait_s}s..."
+                    f"🚦 {operation_name} hit Gemini quota limit (429) on attempt "
+                    f"{attempt+1}/{max_retries}. Waiting {wait_s}s before retry..."
                 )
+            else:
+                wait_s = base_delay ** attempt
+
+            if attempt < max_retries - 1 and retryable:
+                if not is_quota_error:
+                    logger.warning(
+                        f"⚠️ {operation_name} failed (attempt {attempt+1}/{max_retries}): {exc}. "
+                        f"Retry in {wait_s}s..."
+                    )
                 time.sleep(wait_s)
             else:
                 if not retryable:
@@ -481,12 +596,16 @@ def get_gemini_client():
     )
 
 def call_gemini_with_cache(prompt, cache_key_prefix, max_retries=2):
-    """Call Gemini API with STABLE caching to minimize costs."""
+    """Call Gemini API with STABLE caching to minimize costs.
+
+    Rate limiting is applied via the global gemini_rate_limiter before every
+    actual network call so that the 15 req/min free-tier quota is respected.
+    """
     # Użycie MD5 zamiast losowego hash(), aby cache przetrwał restarty serwera
     prompt_hash = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:10]
     cache_key = f"gemini:{cache_key_prefix}:{prompt_hash}"
 
-    # Check cache first
+    # Check cache first — no quota consumed for a cache hit
     cached = get_cached_api_response(cache_key)
     if cached:
         return cached
@@ -495,6 +614,8 @@ def call_gemini_with_cache(prompt, cache_key_prefix, max_retries=2):
     client = get_gemini_client()
     for attempt in range(max_retries):
         try:
+            # Throttle before every attempt (including retries)
+            gemini_rate_limiter.wait_for_quota()
             response = client.generate_content(prompt)
             result = response.text
 
@@ -505,8 +626,13 @@ def call_gemini_with_cache(prompt, cache_key_prefix, max_retries=2):
         except Exception as e:
             if attempt == max_retries - 1:
                 raise
-            logger.warning(f"⚠️  Gemini API attempt {attempt + 1} failed: {e}")
-            time.sleep(2 ** attempt)  # exponential backoff
+            is_quota_error = "429" in str(e) or "resource_exhausted" in str(e).lower()
+            wait_s = 60 * (2 ** attempt) if is_quota_error else 2 ** attempt
+            logger.warning(
+                f"⚠️  Gemini API attempt {attempt + 1} failed: {e}. "
+                f"Retrying in {wait_s}s..."
+            )
+            time.sleep(wait_s)
 
     raise RuntimeError("Gemini API failed after retries")
 
@@ -712,7 +838,10 @@ def generate_video_segment(prompt, aspect_ratio="9:16"):
     """Generuje pojedynczy klip wideo i zwraca lokalną ścieżkę tymczasową"""
     logger.info(f"🎬 Generowanie segmentu: {prompt[:50]}...")
     client = get_gemini_client()
-    
+
+    # Throttle before submitting the Veo generation request
+    gemini_rate_limiter.wait_for_quota()
+
     operation = retry_with_backoff(
         "Veo generate_videos",
         lambda: client.models.generate_videos(
@@ -1900,7 +2029,13 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "storage_dir": STORAGE_DIR,
         "elevenlabs": "✅ configured" if ELEVENLABS_API_KEY else "❌ not configured",
-        "metrics": METRICS
+        "metrics": METRICS,
+        "gemini_rate_limiter": {
+            "min_interval_seconds": GEMINI_MIN_INTERVAL_SECONDS,
+            "daily_quota": GEMINI_DAILY_QUOTA,
+            "daily_warn_threshold": GEMINI_DAILY_WARN_THRESHOLD,
+            "requests_today": gemini_rate_limiter.daily_count,
+        },
     }), 200
 
 @app.route("/metrics", methods=["GET"])
