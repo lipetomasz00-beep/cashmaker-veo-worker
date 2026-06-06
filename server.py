@@ -18,7 +18,6 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_from_directory
 from PIL import Image, ImageDraw, ImageFont
 from elevenlabs.client import ElevenLabs
-from gradio_client import Client
 
 # ---------------------------------------------------------------------------
 # KONFIGURACJA I INICJALIZACJA
@@ -649,11 +648,8 @@ def get_render_from_db(job_id):
 # ---------------------------------------------------------------------------
 
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """Generate a video segment via HunyuanVideo using Diffusers library
+    """Generate a video segment via HunyuanVideo using HF Inference API
     and save it directly to output_path."""
-
-    from diffusers import HunyuanVideoPipeline
-    import torch
 
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
@@ -667,32 +663,35 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     }
     width, height = ratio_map.get(aspect_ratio, (544, 960))
 
-    logger.info(f"🤗 HunyuanVideo (Diffusers): generating {width}x{height} video for prompt: {prompt[:60]}...")
+    logger.info(f"🤗 HunyuanVideo (HF Inference API): generating {width}x{height} video for prompt: {prompt[:60]}...")
 
-    # Initialize the pipeline
-    pipe = HunyuanVideoPipeline.from_pretrained(
-        "tencent/HunyuanVideo",
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
+    api_url = "https://api-inference.huggingface.co/models/tencent/HunyuanVideo"
+    headers = {"Authorization": f"Bearer {hf_token}"}
 
-    logger.info("⏳ Generating video with HunyuanVideo...")
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "width": width,
+            "height": height,
+            "num_frames": 61,
+            "num_inference_steps": 30,
+        }
+    }
 
-    # Generate video
-    output = pipe(
-        prompt=prompt,
-        height=height,
-        width=width,
-        num_frames=61,
-        num_inference_steps=30,
-    )
+    logger.info("⏳ Calling HunyuanVideo API...")
 
-    # Save the generated video
-    video_frames = output.frames[0]  # Get first (and only) video
+    def _call_api():
+        response = requests.post(api_url, headers=headers, json=payload, timeout=600)
+        if response.status_code == 503:
+            raise RuntimeError("Model loading (503) – retry")
+        response.raise_for_status()
+        return response
 
-    # Convert frames to video file
-    import imageio
-    imageio.mimsave(output_path, video_frames, fps=24)
+    response = retry_with_backoff("HunyuanVideo API", _call_api, max_retries=3, base_delay=30)
+
+    # Save the video
+    with open(output_path, "wb") as f:
+        f.write(response.content)
 
     logger.info(f"✅ Video saved to {output_path}")
     return output_path
