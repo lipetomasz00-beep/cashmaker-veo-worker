@@ -68,6 +68,104 @@ IDEMPOTENCY_LOCK = threading.Lock()
 API_CACHE = {}
 API_CACHE_TTL_SECONDS = 3600  # 1 hour
 
+# ---------------------------------------------------------------------------
+# GEMINI API RATE LIMITER
+# Enforces Gemini free-tier quotas:
+#   RPM  : 15 requests/min  → minimum 4 s between calls
+#   RPD  : 1500 requests/day → warn when approaching limit
+# ---------------------------------------------------------------------------
+
+GEMINI_MIN_INTERVAL_SECONDS = float(os.getenv("GEMINI_MIN_INTERVAL_SECONDS", "4.0"))
+GEMINI_DAILY_QUOTA = int(os.getenv("GEMINI_DAILY_QUOTA", "1500"))
+GEMINI_DAILY_WARN_THRESHOLD = int(os.getenv("GEMINI_DAILY_WARN_THRESHOLD", "1350"))  # warn at 90 %
+
+
+class GeminiRateLimiter:
+    """
+    Thread-safe rate limiter for the Gemini API.
+
+    Enforces a minimum interval between consecutive calls (RPM quota) and
+    tracks the daily request count (RPD quota), emitting a warning when the
+    daily limit is approaching.
+    """
+
+    def __init__(self, min_interval: float = GEMINI_MIN_INTERVAL_SECONDS,
+                 daily_quota: int = GEMINI_DAILY_QUOTA,
+                 daily_warn_threshold: int = GEMINI_DAILY_WARN_THRESHOLD):
+        self._lock = threading.Lock()
+        self._min_interval = min_interval          # seconds between calls
+        self._last_call_time: float = 0.0          # epoch seconds of last call
+        self._daily_quota = daily_quota
+        self._daily_warn_threshold = daily_warn_threshold
+        self._daily_count: int = 0
+        self._day_start: datetime = datetime.utcnow().date()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def wait_for_quota(self) -> None:
+        """
+        Block until it is safe to make the next Gemini API call.
+
+        1. Resets the daily counter when the UTC date rolls over.
+        2. Logs a warning when the daily quota is 90 % consumed.
+        3. Sleeps for the remainder of the minimum inter-call interval.
+        """
+        with self._lock:
+            self._maybe_reset_daily_counter()
+            self._check_daily_quota()
+            self._enforce_rpm_throttle()
+            self._daily_count += 1
+            self._last_call_time = time.time()
+
+    @property
+    def daily_count(self) -> int:
+        with self._lock:
+            self._maybe_reset_daily_counter()
+            return self._daily_count
+
+    # ------------------------------------------------------------------
+    # Internal helpers (must be called with self._lock held)
+    # ------------------------------------------------------------------
+
+    def _maybe_reset_daily_counter(self) -> None:
+        today = datetime.utcnow().date()
+        if today != self._day_start:
+            logger.info(
+                f"📅 Gemini daily counter reset (was {self._daily_count} requests on {self._day_start})"
+            )
+            self._daily_count = 0
+            self._day_start = today
+
+    def _check_daily_quota(self) -> None:
+        if self._daily_count >= self._daily_warn_threshold:
+            remaining = self._daily_quota - self._daily_count
+            logger.warning(
+                f"⚠️  Gemini daily quota nearly exhausted: "
+                f"{self._daily_count}/{self._daily_quota} requests used today "
+                f"({remaining} remaining). Approaching RPD limit."
+            )
+
+    def _enforce_rpm_throttle(self) -> None:
+        elapsed = time.time() - self._last_call_time
+        wait_needed = self._min_interval - elapsed
+        if wait_needed > 0:
+            logger.info(
+                f"⏳ Gemini rate limiter: throttling for {wait_needed:.2f}s "
+                f"(min interval {self._min_interval}s, elapsed {elapsed:.2f}s)"
+            )
+            # Release the lock while sleeping so other threads are not blocked
+            self._lock.release()
+            try:
+                time.sleep(wait_needed)
+            finally:
+                self._lock.acquire()
+
+
+# Global singleton — shared across all threads
+gemini_rate_limiter = GeminiRateLimiter()
+
 def cache_api_response(cache_key, response_data):
     """Cache an API response with TTL."""
     API_CACHE[cache_key] = {
@@ -180,7 +278,7 @@ def validate_required_env():
         raise RuntimeError("System dependency 'ffprobe' is missing from PATH. Install it first.")
 
     # 2. Walidacja obecności wymaganych zmiennych
-    required = ["GEMINI_API_KEY", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
+    required = ["GEMINI_API_KEY", "HF_TOKEN", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         raise RuntimeError(
@@ -215,8 +313,18 @@ def validate_required_env():
             logger.info("✅ Klucz OPENAI_API_KEY zweryfikowany pomyślnie.")
         except Exception as e:
             raise RuntimeError(f"OPENAI_API_KEY validation failed: {e}")
+
+        # Walidacja HF_TOKEN (wymagany do generowania wideo przez HunyuanVideo)
+        try:
+            hf_token = os.getenv("HF_TOKEN")
+            if not hf_token:
+                raise ValueError("HF_TOKEN is empty")
+            logger.info("✅ Klucz HF_TOKEN zweryfikowany pomyślnie.")
+        except Exception as e:
+            raise RuntimeError(f"HF_TOKEN validation failed: {e}")
     else:
         logger.info("🧪 DRY_RUN lub TESTING włączony - pomijam twardą walidację kluczy API.")
+
 def require_api_key():
     """Wymagaj poprawnego API key w nagłówku Authorization lub X-API-Key."""
     auth_header = request.headers.get("Authorization", "")
@@ -274,18 +382,35 @@ def remember_idempotency(idempotency_key, response_obj):
         }
 
 def retry_with_backoff(operation_name, func, max_retries=3, base_delay=2):
-    """Retry helper z exponential backoff dla wywołań zewnętrznych API."""
+    """Retry helper z exponential backoff dla wywołań zewnętrznych API.
+
+    429 RESOURCE_EXHAUSTED errors receive a longer initial wait (60 s) so that
+    the Gemini RPM window has time to refill before the next attempt.
+    """
     for attempt in range(max_retries):
         try:
             return func()
         except Exception as exc:
             retryable = _is_retryable_exception(exc)
-            wait_s = base_delay ** attempt
-            if attempt < max_retries - 1 and retryable:
+            is_quota_error = "429" in str(exc) or "resource_exhausted" in str(exc).lower()
+
+            if is_quota_error:
+                # Quota errors need a much longer back-off than generic retries.
+                # Start at 60 s and double on each subsequent attempt.
+                wait_s = 60 * (2 ** attempt)
                 logger.warning(
-                    f"⚠️ {operation_name} failed (attempt {attempt+1}/{max_retries}): {exc}. "
-                    f"Retry in {wait_s}s..."
+                    f"🚦 {operation_name} hit Gemini quota limit (429) on attempt "
+                    f"{attempt+1}/{max_retries}. Waiting {wait_s}s before retry..."
                 )
+            else:
+                wait_s = base_delay ** attempt
+
+            if attempt < max_retries - 1 and retryable:
+                if not is_quota_error:
+                    logger.warning(
+                        f"⚠️ {operation_name} failed (attempt {attempt+1}/{max_retries}): {exc}. "
+                        f"Retry in {wait_s}s..."
+                    )
                 time.sleep(wait_s)
             else:
                 if not retryable:
@@ -471,12 +596,16 @@ def get_gemini_client():
     )
 
 def call_gemini_with_cache(prompt, cache_key_prefix, max_retries=2):
-    """Call Gemini API with STABLE caching to minimize costs."""
+    """Call Gemini API with STABLE caching to minimize costs.
+
+    Rate limiting is applied via the global gemini_rate_limiter before every
+    actual network call so that the 15 req/min free-tier quota is respected.
+    """
     # Użycie MD5 zamiast losowego hash(), aby cache przetrwał restarty serwera
     prompt_hash = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:10]
     cache_key = f"gemini:{cache_key_prefix}:{prompt_hash}"
 
-    # Check cache first
+    # Check cache first — no quota consumed for a cache hit
     cached = get_cached_api_response(cache_key)
     if cached:
         return cached
@@ -485,6 +614,8 @@ def call_gemini_with_cache(prompt, cache_key_prefix, max_retries=2):
     client = get_gemini_client()
     for attempt in range(max_retries):
         try:
+            # Throttle before every attempt (including retries)
+            gemini_rate_limiter.wait_for_quota()
             response = client.generate_content(prompt)
             result = response.text
 
@@ -495,8 +626,13 @@ def call_gemini_with_cache(prompt, cache_key_prefix, max_retries=2):
         except Exception as e:
             if attempt == max_retries - 1:
                 raise
-            logger.warning(f"⚠️  Gemini API attempt {attempt + 1} failed: {e}")
-            time.sleep(2 ** attempt)  # exponential backoff
+            is_quota_error = "429" in str(e) or "resource_exhausted" in str(e).lower()
+            wait_s = 60 * (2 ** attempt) if is_quota_error else 2 ** attempt
+            logger.warning(
+                f"⚠️  Gemini API attempt {attempt + 1} failed: {e}. "
+                f"Retrying in {wait_s}s..."
+            )
+            time.sleep(wait_s)
 
     raise RuntimeError("Gemini API failed after retries")
 
@@ -698,10 +834,14 @@ def download_video_with_backoff(video_uri, temp_path, max_retries=5):
 # GENEROWANIE SEGMENTÓW WIDEO
 # ---------------------------------------------------------------------------
 
-def generate_video_segment(client, prompt, aspect_ratio="9:16"):
+def generate_video_segment(prompt, aspect_ratio="9:16"):
     """Generuje pojedynczy klip wideo i zwraca lokalną ścieżkę tymczasową"""
     logger.info(f"🎬 Generowanie segmentu: {prompt[:50]}...")
-    
+    client = get_gemini_client()
+
+    # Throttle before submitting the Veo generation request
+    gemini_rate_limiter.wait_for_quota()
+
     operation = retry_with_backoff(
         "Veo generate_videos",
         lambda: client.models.generate_videos(
@@ -1304,7 +1444,6 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
     try:
         check_job_timeout()
-        client = get_gemini_client()
         topic = raw_data.get("topic", "Finanse osobiste")
         raw_data = apply_optimization_rules(raw_data, topic)
         aspect_ratio = raw_data.get("aspectRatio", "9:16")
@@ -1371,7 +1510,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             save_checkpoint(job_id, current_stage, data={"topic": topic, "key": key})
             logger.info(f"🎥 Generowanie sceny: {key.upper()}")
             
-            file_path = generate_video_segment(client, prompt_text, aspect_ratio)
+            file_path = generate_video_segment(prompt_text, aspect_ratio)
 
             import shutil
             shutil.copy2(file_path, stable_path)
@@ -1582,324 +1721,8 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
                 except Exception as e:
                     logger.warning(f"⚠️ Nie udało się usunąć {srt_file}: {e}")
 
-NARRATION_TEMPLATES = {
-    "hook": "Większość osób traci pieniądze na złym koncie. Czy i ty?",
-    "problem": "Banki promują oferty, które szybko tracą atrakcyjne warunki.",
-    "rozwiązanie": "Regularne porównywanie ofert pozwala znaleźć korzystniejsze opcje i zaoszczędzić na rachunkach."
-}
 
-def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=None):
-    """
-    Główny proces montażu sekwencji - uruchamiany w tle
-    """
-    STAGES = [
-        "hook_video",
-        "problem_video",
-        "solution_video",
-        "narration",
-        "assembly",
-        "upload",
-    ]
 
-    def _stage_done(stage):
-        """Return True when this stage was already completed before the resume point."""
-        if resume_from is None:
-            return False
-        try:
-            return STAGES.index(stage) < STAGES.index(resume_from)
-        except ValueError:
-            return False
-
-    job_start_time = time.time()
-    def check_job_timeout():
-        if time.time() - job_start_time > MAX_JOB_DURATION_SECONDS:
-            raise TimeoutError(f"Job exceeded the maximum execution limit of {MAX_JOB_DURATION_SECONDS} seconds.")
-
-    segment_files = []
-    audio_files_dict = {}
-    srt_file = None
-    current_stage = "init"
-    job_paused = False
-
-    try:
-        check_job_timeout()
-        client = get_gemini_client()
-        topic = raw_data.get("topic", "Finanse osobiste")
-        raw_data = apply_optimization_rules(raw_data, topic)
-        aspect_ratio = raw_data.get("aspectRatio", "9:16")
-        host = raw_data.get("host", "localhost:5000")
-        custom_narration = raw_data.get("narration")
-        hashtags = raw_data.get("hashtags")
-        if not hashtags:
-            hashtags = build_hashtags(topic, custom_narration, MAX_HASHTAGS)
-
-        if resume_from:
-            logger.info(f"▶️  RESUME Job {job_id} | Wznawianie od etapu: {resume_from}")
-        else:
-            logger.info(f"🚀 START renderowania Job ID: {job_id} | Temat: {topic}")
-
-        if ENABLE_DRY_RUN:
-            logger.info("🧪 DRY_RUN enabled: skipping external providers and returning simulated success")
-            simulated_filename = f"dryrun_{job_id}.mp4"
-            simulated_path = os.path.join(STORAGE_DIR, simulated_filename)
-            with open(simulated_path, "wb") as f:
-                f.write(b"DRY_RUN")
-            video_url = f"https://{host}/videos/{simulated_filename}"
-            save_render_to_db(job_id, topic, 'success', video_url, video_duration=0.0)
-            if webhook_url:
-                send_webhook(webhook_url, {
-                    "event_type": "render.completed",
-                    "job_id": job_id,
-                    "status": "success",
-                    "video_url": video_url,
-                    # ... reszta payloadu dry_run bez zmian ...
-                    "dry_run": True,
-                })
-            METRICS["jobs_success"] += 1
-            return
-
-        prompts = {
-            "hook": f"Dynamic cinematic shot, extreme close up, shock and stress, concept of {topic}, corporate finance style, 4k, professional",
-            "problem": f"A person looking anxiously at bills and charts on a screen, dark moody lighting, financial stress, 4k, professional",
-            "rozwiązanie": f"Bright clean studio lighting, a smartphone screen displaying green rising financial growth charts, relief, 4k, professional"
-        }
-
-        logger.info("📋 Szablon: HOOK → PROBLEM → ROZWIĄZANIE")
-
-        stage_map = {
-            "hook":       "hook_video",
-            "problem":    "problem_video",
-            "rozwiązanie": "solution_video",
-        }
-
-        for key, prompt_text in prompts.items():
-            check_job_timeout()
-            stage_name = stage_map[key]
-
-            # POPRAWKA 1: Pliki dla wznawiania zadań MUSZĄ być w trwałym STORAGE_DIR, nie w ulotnym tempfile
-            stable_path = os.path.join(STORAGE_DIR, f"seg_{job_id}_{key}.mp4")
-
-            if _stage_done(stage_name):
-                if os.path.exists(stable_path):
-                    logger.info(f"⏩ Scena {key.upper()} już istnieje – pomijam Veo.")
-                    segment_files.append(stable_path)
-                    continue
-                logger.info(f"⚠️  Plik sceny {key} zaginął ze STORAGE_DIR – regeneruję...")
-
-            current_stage = stage_name
-            save_checkpoint(job_id, current_stage, data={"topic": topic, "key": key})
-            logger.info(f"🎥 Generowanie sceny: {key.upper()}")
-            
-            file_path = generate_video_segment(client, prompt_text, aspect_ratio)
-
-            import shutil
-            shutil.copy2(file_path, stable_path)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-
-            segment_files.append(stable_path)
-            logger.info(f"✅ Scena {key} gotowa")
-
-        logger.info(f"✅ Wszystkie 3 sceny gotowe")
-
-        check_job_timeout()
-        if not _stage_done("narration"):
-            current_stage = "narration"
-            save_checkpoint(job_id, current_stage, data={"topic": topic})
-            logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
-
-        narration_texts = custom_narration if custom_narration else NARRATION_TEMPLATES
-        audio_files_dict = generate_audio_narration(narration_texts, job_id)
-        logger.info(f"✅ Lektor wygenerowany")
-
-        check_job_timeout()
-        srt_file = None
-        
-        # Generowanie napisów
-        combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
-        audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_trans_{job_id}.txt")
-
-        try:
-            with open(audio_list_file, "w") as f:
-                for scene_key in ["hook", "problem", "rozwiązanie"]:
-                    if scene_key in audio_files_dict:
-                        f.write(f"file '{audio_files_dict[scene_key]['path']}'\n")
-
-            ffmpeg_concat = [
-                'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
-                '-c:a', 'libmp3lame', '-q:a', '4',
-                combined_for_transcription
-            ]
-            
-            # ZABEZPIECZENIE: Try-except dla łączenia audio
-            try:
-                subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-                srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
-            except subprocess.CalledProcessError as e:
-                logger.error(f"❌ Błąd FFmpeg przy łączeniu audio dla Whispera: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'Brak'}")
-                srt_file = None
-            except subprocess.TimeoutExpired:
-                logger.error("❌ Błąd: Timeout FFmpeg przy łączeniu audio dla Whispera.")
-                srt_file = None
-
-        except Exception as e:
-            logger.warning(f"⚠️ Napisy niedostępne: {e}")
-            srt_file = None
-        finally:
-            if os.path.exists(combined_for_transcription):
-                os.remove(combined_for_transcription)
-            if os.path.exists(audio_list_file):
-                os.remove(audio_list_file)
-
-        check_job_timeout()
-        logger.info("⏱️ Etap automatycznego dopasowania długości...")
-
-        target_duration = int(raw_data.get("targetDuration", 15))
-        speed = calculate_video_speed(audio_files_dict, target_duration)
-
-        if speed != 1.0:
-            logger.info(f"⚡ Dopasowywanie prędkości wideo do {speed:.2f}x...")
-            segment_files = generate_video_with_speed_adjustment(segment_files, speed)
-            logger.info(f"✅ Segmenty dopasowane")
-
-        check_job_timeout()
-        current_stage = "assembly"
-        save_checkpoint(job_id, current_stage, data={"topic": topic, "speed": speed})
-        logger.info("🎬 Główny montaż (wideo + audio + napisy + watermark)...")
-
-        final_filename = f"render_{job_id}.mp4"
-        final_output_path = os.path.join(STORAGE_DIR, final_filename)
-
-        final_output_path = concat_video_with_audio_and_subtitles(segment_files, audio_files_dict, srt_file, job_id, final_output_path, speed)
-
-        if not final_output_path:
-            raise RuntimeError("Nie udało się złożyć finalnego wideo (błąd w concat_video_with_audio_and_subtitles).")
-
-        check_job_timeout()
-        logger.info("🎨 Dodawanie planszy końcowej...")
-
-        endscreen_path = os.path.join(tempfile.gettempdir(), f"endscreen_{job_id}.mp4")
-        generate_end_screen(job_id, topic, endscreen_path)
-
-        final_with_endscreen = os.path.join(tempfile.gettempdir(), f"final_with_endscreen_{job_id}.mp4")
-
-        concat_list = os.path.join(tempfile.gettempdir(), f"final_concat_{job_id}.txt")
-        with open(concat_list, "w") as f:
-            f.write(f"file '{final_output_path}'\n")
-            f.write(f"file '{endscreen_path}'\n")
-
-        ffmpeg_final_concat = [
-            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list,
-            '-c', 'copy',
-            final_with_endscreen
-        ]
-        
-        # ZABEZPIECZENIE: Łapanie błędu krytycznego podczas finałowego sklejania
-        try:
-            subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-            os.replace(final_with_endscreen, final_output_path)
-            logger.info(f"✅ Plansza końcowa dodana")
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.error(f"❌ Nie udało się dodać planszy końcowej. Zostawiam wideo bez niej. Błąd: {e}")
-            # Nie przerywamy zadania, po prostu wydamy wideo bez doklejonej planszy
-
-        for f in [endscreen_path, concat_list]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except:
-                    pass
-
-        check_job_timeout()
-        video_duration = get_video_duration(final_output_path)
-        file_size_mb = os.path.getsize(final_output_path) / (1024 * 1024)
-        if file_size_mb > MAX_OUTPUT_VIDEO_MB:
-            raise ValueError(
-                f"Output file too large: {file_size_mb:.1f} MB > {MAX_OUTPUT_VIDEO_MB} MB"
-            )
-
-        logger.info(f"✅ SUKCES! Film gotowy: {final_filename}")
-        logger.info(f"  ⏱️ Czas trwania: {video_duration:.2f}s")
-        logger.info(f"  📊 Rozmiar: {file_size_mb:.1f} MB")
-        logger.info(f"  ⚡ Prędkość: {speed:.2f}x")
-
-        video_url = f"https://{host}/videos/{final_filename}"
-        logger.info(f"📺 URL: {video_url}")
-
-        current_stage = "upload"
-        save_checkpoint(job_id, current_stage, data={"video_url": video_url})
-        save_render_to_db(job_id, topic, 'success', video_url, video_duration=video_duration)
-        logger.info(f"💾 Historia zapisana")
-
-        if webhook_url:
-            logger.info(f"🔔 Wysyłanie webhook...")
-            try:
-                webhook_payload = {
-                    "event_type": "render.completed",
-                    "job_id": job_id,
-                    "status": "success",
-                    "video_url": video_url,
-                    # ... reszta payloadu bez zmian ...
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-                response = send_webhook(webhook_url, webhook_payload)
-                logger.info(f"✅ Webhook wysłany (status: {response.status_code})")
-                METRICS["webhook_success"] += 1
-            except requests.RequestException as e:
-                logger.error(f"⚠️ Błąd webhook: {e}")
-                METRICS["webhook_failed"] += 1
-        METRICS["jobs_success"] += 1
-
-    except Exception as e:
-        logger.error(f"❌ BŁĄD KRYTYCZNY Job {job_id} na etapie '{current_stage}': {e}", exc_info=True)
-        METRICS["jobs_failed"] += 1
-        METRICS["last_error"] = str(e)
-
-        job_paused = True
-        save_checkpoint(job_id, current_stage, error=str(e))
-        logger.error(f"⏸️ Job {job_id} PAUSED at '{current_stage}': {e}")
-
-        if webhook_url:
-            try:
-                webhook_payload = {
-                    "event_type": "render.paused",
-                    "job_id": job_id,
-                    "status": "paused",
-                    "paused_at_stage": current_stage,
-                    "error": str(e),
-                    "resume_url": f"https://{raw_data.get('host', 'localhost:5000')}/resume/{job_id}",
-                    "source": "cashmaker-veo-worker",
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-                send_webhook(webhook_url, webhook_payload)
-                logger.info(f"🔔 Webhook pauzy wysłany")
-            except Exception as webhook_error:
-                logger.error(f"⚠️ Błąd webhook: {webhook_error}")
-
-    finally:
-        RENDER_SEMAPHORE.release()
-        if job_paused:
-            logger.info("⏸️ Job paused – zachowuję pliki w STORAGE_DIR dla wznowienia.")
-        else:
-            logger.info("🧹 Czyszczenie plików...")
-            for path in segment_files:
-                # Nie usuwamy głównych segmentów ze STORAGE_DIR od razu, zostawiamy to funkcji cleanup_old_files() 
-                # Zabezpiecza to pliki, gdyby API wznawiania ich wciąż potrzebowało w tle
-                pass
-
-            for scene_key, audio_info in audio_files_dict.items():
-                audio_path = audio_info.get("path")
-                if audio_path and os.path.exists(audio_path):
-                    try:
-                        os.remove(audio_path)
-                    except Exception as e:
-                        logger.warning(f"⚠️ Nie udało się usunąć {audio_path}: {e}")
-
-            if srt_file and os.path.exists(srt_file):
-                try:
-                    os.remove(srt_file)
-                except:
-                    pass
 
 # ---------------------------------------------------------------------------
 # CLEANUP STARYCH PLIKÓW
@@ -2249,7 +2072,13 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "storage_dir": STORAGE_DIR,
         "elevenlabs": "✅ configured" if ELEVENLABS_API_KEY else "❌ not configured",
-        "metrics": METRICS
+        "metrics": METRICS,
+        "gemini_rate_limiter": {
+            "min_interval_seconds": GEMINI_MIN_INTERVAL_SECONDS,
+            "daily_quota": GEMINI_DAILY_QUOTA,
+            "daily_warn_threshold": GEMINI_DAILY_WARN_THRESHOLD,
+            "requests_today": gemini_rate_limiter.daily_count,
+        },
     }), 200
 
 @app.route("/metrics", methods=["GET"])
