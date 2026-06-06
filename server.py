@@ -648,14 +648,14 @@ def get_render_from_db(job_id):
 # ---------------------------------------------------------------------------
 
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """Generate a video segment via HunyuanVideo using Replicate API
+    """Generate a video segment via HunyuanVideo using Fal.ai API
     and save it directly to output_path."""
 
-    import replicate
+    import fal_client
 
-    replicate_token = os.getenv("REPLICATE_API_TOKEN")
-    if not replicate_token:
-        raise ValueError("REPLICATE_API_TOKEN environment variable is not set")
+    fal_key = os.getenv("FAL_KEY")
+    if not fal_key:
+        raise ValueError("FAL_KEY environment variable is not set")
 
     # Map aspect ratio to width/height
     ratio_map = {
@@ -665,17 +665,15 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     }
     width, height = ratio_map.get(aspect_ratio, (544, 960))
 
-    logger.info(f"🤗 HunyuanVideo (Replicate): generating {width}x{height} video for prompt: {prompt[:60]}...")
+    logger.info(f"🤗 HunyuanVideo (Fal.ai): generating {width}x{height} video for prompt: {prompt[:60]}...")
 
-    client = replicate.Client(api_token=replicate_token)
-
-    logger.info("⏳ Calling HunyuanVideo via Replicate...")
+    logger.info("⏳ Calling HunyuanVideo via Fal.ai...")
 
     def _call_api():
         try:
-            output = client.run(
-                "tencent/hunyuan-video:latest",
-                input={
+            result = fal_client.run(
+                "fal-ai/hunyuan-video",
+                arguments={
                     "prompt": prompt,
                     "width": width,
                     "height": height,
@@ -683,29 +681,23 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
                     "num_inference_steps": 30,
                 }
             )
-            return output
+            return result
         except Exception as e:
             if "overloaded" in str(e).lower() or "busy" in str(e).lower():
                 raise RuntimeError("Model overloaded – retry")
             raise
 
-    result = retry_with_backoff("HunyuanVideo Replicate", _call_api, max_retries=3, base_delay=30)
+    result = retry_with_backoff("HunyuanVideo Fal.ai", _call_api, max_retries=3, base_delay=30)
 
-    # result is a URL or file path from Replicate
-    if isinstance(result, str) and result.startswith("http"):
-        # Download from URL
-        response = requests.get(result, timeout=60)
-        response.raise_for_status()
-        with open(output_path, "wb") as f:
-            f.write(response.content)
-    elif isinstance(result, list) and result:
-        # Replicate returns list of URLs
-        response = requests.get(result[0], timeout=60)
+    # result is a dict with 'video' URL
+    if isinstance(result, dict) and "video" in result:
+        video_url = result["video"]
+        response = requests.get(video_url, timeout=60)
         response.raise_for_status()
         with open(output_path, "wb") as f:
             f.write(response.content)
     else:
-        raise RuntimeError(f"Unexpected Replicate output format: {result}")
+        raise RuntimeError(f"Unexpected Fal.ai output format: {result}")
 
     logger.info(f"✅ Video saved to {output_path}")
     return output_path
