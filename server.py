@@ -303,7 +303,7 @@ def validate_required_env():
         except Exception as e:
             raise RuntimeError(f"ELEVENLABS_API_KEY validation failed: {e}")
 
-       # Walidacja OpenAI
+        # Walidacja OpenAI
         try:
             from openai import OpenAI
             oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
