@@ -648,14 +648,14 @@ def get_render_from_db(job_id):
 # ---------------------------------------------------------------------------
 
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """Generate a video segment via HunyuanVideo using HF InferenceClient
+    """Generate a video segment via HunyuanVideo using Replicate API
     and save it directly to output_path."""
 
-    from huggingface_hub import InferenceClient
+    import replicate
 
-    hf_token = os.getenv("HF_TOKEN")
-    if not hf_token:
-        raise ValueError("HF_TOKEN environment variable is not set")
+    replicate_token = os.getenv("REPLICATE_API_TOKEN")
+    if not replicate_token:
+        raise ValueError("REPLICATE_API_TOKEN environment variable is not set")
 
     # Map aspect ratio to width/height
     ratio_map = {
@@ -665,32 +665,47 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     }
     width, height = ratio_map.get(aspect_ratio, (544, 960))
 
-    logger.info(f"🤗 HunyuanVideo (HF InferenceClient): generating {width}x{height} video for prompt: {prompt[:60]}...")
+    logger.info(f"🤗 HunyuanVideo (Replicate): generating {width}x{height} video for prompt: {prompt[:60]}...")
 
-    client = InferenceClient(api_key=hf_token)
+    client = replicate.Client(api_token=replicate_token)
 
-    logger.info("⏳ Calling HunyuanVideo API...")
+    logger.info("⏳ Calling HunyuanVideo via Replicate...")
 
     def _call_api():
         try:
-            image = client.text_to_image(
-                prompt=prompt,
-                model="tencent/HunyuanVideo",
+            output = client.run(
+                "tencent/hunyuan-video:latest",
+                input={
+                    "prompt": prompt,
+                    "width": width,
+                    "height": height,
+                    "num_frames": 61,
+                    "num_inference_steps": 30,
+                }
             )
-            return image
+            return output
         except Exception as e:
-            if "503" in str(e) or "loading" in str(e).lower():
-                raise RuntimeError("Model loading – retry")
+            if "overloaded" in str(e).lower() or "busy" in str(e).lower():
+                raise RuntimeError("Model overloaded – retry")
             raise
 
-    result = retry_with_backoff("HunyuanVideo API", _call_api, max_retries=3, base_delay=30)
+    result = retry_with_backoff("HunyuanVideo Replicate", _call_api, max_retries=3, base_delay=30)
 
-    # Save the result
-    if hasattr(result, 'save'):
-        result.save(output_path)
-    else:
+    # result is a URL or file path from Replicate
+    if isinstance(result, str) and result.startswith("http"):
+        # Download from URL
+        response = requests.get(result, timeout=60)
+        response.raise_for_status()
         with open(output_path, "wb") as f:
-            f.write(result)
+            f.write(response.content)
+    elif isinstance(result, list) and result:
+        # Replicate returns list of URLs
+        response = requests.get(result[0], timeout=60)
+        response.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+    else:
+        raise RuntimeError(f"Unexpected Replicate output format: {result}")
 
     logger.info(f"✅ Video saved to {output_path}")
     return output_path
