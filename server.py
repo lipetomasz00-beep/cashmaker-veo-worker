@@ -1766,7 +1766,8 @@ def health_check():
         "storage_dir": STORAGE_DIR,
         "elevenlabs": "✅ configured" if ELEVENLABS_API_KEY else "❌ not configured",
         "metrics": METRICS,
-    
+    })
+
 @app.route("/metrics", methods=["GET"])
 def metrics():
     """GET /metrics - proste metryki runtime."""
