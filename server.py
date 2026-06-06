@@ -795,15 +795,14 @@ def get_render_from_db(job_id):
 # ---------------------------------------------------------------------------
 
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """Generuje pojedynczy klip wideo przez Hugging Face Inference API (HunyuanVideo)
-    i zapisuje wynik bezpośrednio do output_path."""
-    import base64
+    """Generate a video segment via HunyuanVideo on Hugging Face (Kijai/HunyuanVideo_wrapper)
+    and save it directly to output_path."""
 
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
         raise ValueError("HF_TOKEN environment variable is not set")
 
-    # Map aspect ratio to width/height for HunyuanVideo
+    # Map aspect ratio to width/height
     ratio_map = {
         "9:16": (544, 960),
         "16:9": (960, 544),
@@ -811,54 +810,50 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     }
     width, height = ratio_map.get(aspect_ratio, (544, 960))
 
-    hf_model = os.getenv("HF_MODEL", "tencent/HunyuanVideo")
-    api_url = f"https://api-inference.huggingface.co/models/{hf_model}"
+    logger.info(f"🤗 HunyuanVideo: generating {width}x{height} video for prompt: {prompt[:60]}...")
 
-    headers = {
-        "Authorization": f"Bearer {hf_token}",
-        "Content-Type": "application/json",
-    }
+    hf_client = Client("Kijai/HunyuanVideo_wrapper", hf_token=hf_token)
 
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "width": width,
-            "height": height,
-            "num_frames": int(os.getenv("HF_NUM_FRAMES", "49")),
-            "num_inference_steps": int(os.getenv("HF_INFERENCE_STEPS", "30")),
-        }
-    }
+    logger.info("⏳ Calling HunyuanVideo predict()...")
+    result = retry_with_backoff(
+        "HunyuanVideo predict",
+        lambda: hf_client.predict(
+            prompt=prompt,
+            negative_prompt="low quality, blurry, static, text, watermark",
+            infer_steps=30,
+            guidance_scale=6.0,
+            width=width,
+            height=height,
+            num_frames=61,
+            api_name="/generate_video",
+        ),
+    )
 
-    logger.info(f"🤗 Wysyłam żądanie do Hugging Face HunyuanVideo ({width}x{height})...")
-
-    def _call_hf():
-        resp = requests.post(api_url, headers=headers, json=payload, timeout=300)
-        if resp.status_code == 503:
-            raise RuntimeError(f"HunyuanVideo model loading (503) – retry")
-        resp.raise_for_status()
-        return resp
-
-    response = retry_with_backoff("HunyuanVideo generate", _call_hf, max_retries=3, base_delay=30)
-
-    content_type = response.headers.get("Content-Type", "")
-    if "video" in content_type or "octet-stream" in content_type:
-        video_bytes = response.content
-    elif "application/json" in content_type:
-        data = response.json()
-        # Some HF endpoints return base64-encoded video
-        if isinstance(data, list) and data and "generated_video" in data[0]:
-            video_bytes = base64.b64decode(data[0]["generated_video"])
-        elif isinstance(data, dict) and "generated_video" in data:
-            video_bytes = base64.b64decode(data["generated_video"])
-        else:
-            raise ValueError(f"❌ HunyuanVideo returned unexpected JSON: {str(data)[:200]}")
+    # The Gradio client returns the local path to the generated video file
+    if isinstance(result, (list, tuple)):
+        video_path = result[0]
     else:
-        raise ValueError(f"❌ HunyuanVideo returned unexpected Content-Type: {content_type}")
+        video_path = result
 
-    with open(output_path, "wb") as f:
-        f.write(video_bytes)
+    if not video_path or not os.path.exists(str(video_path)):
+        raise RuntimeError(
+            f"HunyuanVideo returned an invalid or missing file path: {video_path}"
+        )
 
-    logger.info(f"✅ HunyuanVideo segment zapisany: {output_path} ({len(video_bytes) // 1024} KB)")
+    logger.info(f"✅ HunyuanVideo generation complete, local file: {video_path}")
+
+    # Copy the generated video to the output path
+    shutil.copy(str(video_path), output_path)
+    logger.info(f"✅ Video saved to {output_path}")
+
+    # Clean up the local Gradio temp file
+    try:
+        os.remove(video_path)
+    except Exception as cleanup_err:
+        logger.warning(
+            f"⚠️ Could not remove local HunyuanVideo temp file {video_path}: {cleanup_err}"
+        )
+
     return output_path
 
 
