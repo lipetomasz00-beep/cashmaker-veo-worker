@@ -881,30 +881,54 @@ def generate_video_segment(prompt, aspect_ratio="9:16"):
     download_video_with_backoff(video_uri, temp_file)
     return temp_file
 
-def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """
-    Generuje segment wideo przez Gradio Client (Kijai/HunyuanVideo_wrapper Space).
 
-    Używa gradio_client zamiast surowych żądań HTTP, co pozwala na długotrwałe
-    operacje bez twardego limitu 60 sekund narzucanego przez HF Inference API.
-    """
-    logger.info(f"🎬 HunyuanVideo: generowanie segmentu via Gradio Client: {prompt[:60]}...")
+# ---------------------------------------------------------------------------
+# GENEROWANIE WIDEO: HunyuanVideo (Hugging Face / Gradio)
+# ---------------------------------------------------------------------------
 
+def _get_bucket_client():
+    """Return a boto3 S3 client configured for the Railway video-storage bucket."""
+    import boto3
+    return boto3.client(
+        "s3",
+        endpoint_url=os.getenv("BUCKET_ENDPOINT_URL"),
+        aws_access_key_id=os.getenv("BUCKET_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("BUCKET_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("BUCKET_REGION", "auto"),
+    )
+
+
+def generate_hunyuan_video_segment(prompt, aspect_ratio="9:16"):
+    """
+    Generate a video segment via HunyuanVideo on Hugging Face (Kijai/HunyuanVideo_wrapper)
+    and persist it to the video-storage bucket.
+
+    Returns the bucket object key (str) for the uploaded video.
+    """
     hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise ValueError("HF_TOKEN environment variable is not set")
 
-    # Mapowanie aspect ratio na wymiary obsługiwane przez HunyuanVideo
-    aspect_ratio_map = {
-        "9:16":  (544, 960),
-        "16:9":  (960, 544),
-        "1:1":   (720, 720),
-        "4:3":   (832, 624),
-        "3:4":   (624, 832),
-    }
-    width, height = aspect_ratio_map.get(aspect_ratio, (544, 960))
+    bucket_name = os.getenv("BUCKET_NAME")
+    if not bucket_name:
+        raise ValueError("BUCKET_NAME environment variable is not set")
 
-    def _call_gradio():
-        hf_client = Client("Kijai/HunyuanVideo_wrapper", hf_token=hf_token)
-        return hf_client.predict(
+    logger.info(f"🤗 HunyuanVideo: generating segment for prompt: {prompt[:60]}...")
+
+    # Resolve width/height from aspect_ratio
+    if aspect_ratio == "9:16":
+        width, height = 544, 960
+    elif aspect_ratio == "16:9":
+        width, height = 960, 544
+    else:
+        width, height = 544, 960
+
+    hf_client = Client("Kijai/HunyuanVideo_wrapper", hf_token=hf_token)
+
+    logger.info("⏳ Calling HunyuanVideo predict()...")
+    result = retry_with_backoff(
+        "HunyuanVideo predict",
+        lambda: hf_client.predict(
             prompt=prompt,
             negative_prompt="low quality, blurry, static, text, watermark",
             infer_steps=30,
@@ -913,31 +937,50 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
             height=height,
             num_frames=61,
             api_name="/generate_video",
+        ),
+    )
+
+    # The Gradio client returns the local path to the generated video file
+    if isinstance(result, (list, tuple)):
+        video_path = result[0]
+    else:
+        video_path = result
+
+    if not video_path or not os.path.exists(str(video_path)):
+        raise RuntimeError(
+            f"HunyuanVideo returned an invalid or missing file path: {video_path}"
         )
 
-    result_path = retry_with_backoff("HunyuanVideo Gradio predict", _call_gradio)
+    logger.info(f"✅ HunyuanVideo generation complete, local file: {video_path}")
 
-    # Gradio Client zwraca lokalną ścieżkę do wygenerowanego pliku
-    if not result_path or not os.path.exists(result_path):
-        raise RuntimeError(f"❌ HunyuanVideo: Gradio Client nie zwrócił prawidłowej ścieżki: {result_path}")
+    # Upload to the persistent video-storage bucket
+    object_key = f"hunyuan/{uuid.uuid4().hex}.mp4"
+    s3 = _get_bucket_client()
 
-    logger.info(f"✅ HunyuanVideo: plik tymczasowy gotowy: {result_path}")
+    logger.info(f"☁️  Uploading to bucket '{bucket_name}' as '{object_key}'...")
+    with open(video_path, "rb") as f:
+        s3.upload_fileobj(
+            f,
+            bucket_name,
+            object_key,
+            ExtraArgs={"ContentType": "video/mp4"},
+        )
+    logger.info(f"✅ Video uploaded to bucket: {object_key}")
 
-    # Skopiuj do docelowej ścieżki i usuń plik tymczasowy Gradio
-    with open(result_path, "rb") as src, open(output_path, "wb") as dst:
-        dst.write(src.read())
-
+    # Clean up the local Gradio temp file
     try:
-        os.remove(result_path)
-    except OSError as e:
-        logger.warning(f"⚠️ HunyuanVideo: nie udało się usunąć pliku tymczasowego {result_path}: {e}")
+        os.remove(video_path)
+    except Exception as cleanup_err:
+        logger.warning(
+            f"⚠️ Could not remove local HunyuanVideo temp file {video_path}: {cleanup_err}"
+        )
 
-    logger.info(f"✅ HunyuanVideo: segment zapisany do {output_path}")
-    return output_path
+    return object_key
 
 # ---------------------------------------------------------------------------
 # AUDIO: LEKTOR (ElevenLabs)
 # ---------------------------------------------------------------------------
+
 
 def generate_audio_narration(narration_texts, job_id):
     """Generowanie MP3 z lektorem dla każdej sceny z systemem checkpointów"""
