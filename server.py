@@ -156,10 +156,8 @@ class GeminiRateLimiter:
             )
             # Release the lock while sleeping so other threads are not blocked
             self._lock.release()
-            try:
-                time.sleep(wait_needed)
-            finally:
-                self._lock.acquire()
+            time.sleep(wait_needed)
+            self._lock.acquire()
 
 
 # Global singleton — shared across all threads
