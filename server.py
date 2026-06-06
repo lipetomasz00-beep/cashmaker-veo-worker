@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-MODEL = "veo-3.1-fast-generate-preview"
 DB_PATH = os.path.join(STORAGE_DIR, 'renders.db')
 os.makedirs(STORAGE_DIR, exist_ok=True)
 MAX_CONCURRENT_RENDERS = int(os.getenv("MAX_CONCURRENT_RENDERS", "2"))
@@ -278,7 +277,7 @@ def validate_required_env():
         raise RuntimeError("System dependency 'ffprobe' is missing from PATH. Install it first.")
 
     # 2. Walidacja obecności wymaganych zmiennych
-    required = ["GEMINI_API_KEY", "HF_TOKEN", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
+    required = ["HF_TOKEN", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         raise RuntimeError(
@@ -289,13 +288,14 @@ def validate_required_env():
     if not ENABLE_DRY_RUN and not IS_TESTING:
         logger.info("🔒 Rozpoczynam twardą walidację kluczy API...")
         
-        # Walidacja Gemini
+        # Walidacja Hugging Face
         try:
-            client = get_gemini_client()
-            client.models.get(name=MODEL)  # <-- POPRAWIONE WCIĘCIE
-            logger.info("✅ Klucz GEMINI_API_KEY zweryfikowany pomyślnie.")
+            hf_token = os.getenv("HF_TOKEN")
+            if not hf_token:
+                raise ValueError("HF_TOKEN not set")
+            logger.info("✅ Klucz HF_TOKEN zweryfikowany pomyślnie.")
         except Exception as e:
-            raise RuntimeError(f"GEMINI_API_KEY validation failed: {e}")
+            raise RuntimeError(f"HF_TOKEN validation failed: {e}")
 
         # Walidacja ElevenLabs
         try:
@@ -801,84 +801,82 @@ def get_render_from_db(job_id):
     return None
 
 # ---------------------------------------------------------------------------
-# POBIERANIE WIDEO Z RETRY/BACKOFF
+# GENEROWANIE SEGMENTÓW WIDEO (Hugging Face HunyuanVideo)
 # ---------------------------------------------------------------------------
 
-def download_video_with_backoff(video_uri, temp_path, max_retries=5):
-    """Pobieranie wideo z chmury z automatycznym retry/backoff"""
-    api_key = os.getenv("GEMINI_API_KEY")
-    headers = {"x-goog-api-key": api_key} if api_key else {}
-    
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(video_uri, headers=headers, timeout=60, stream=True)
-            response.raise_for_status()
-            
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            logger.info(f"✅ Wideo pobrane: {temp_path}")
-            return True
-            
-        except Exception as exc:
-            countdown = 2 ** attempt
-            if attempt < max_retries - 1:
-                logger.warning(f"⚠️ Błąd pobierania (próba {attempt+1}/{max_retries}). Ponowna próba za {countdown}s...")
-                time.sleep(countdown)
-            else:
-                logger.error(f"❌ Nie udało się pobrać wideo po {max_retries} próbach: {exc}")
-                raise exc
+def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
+    """Generuje pojedynczy klip wideo przez Hugging Face Inference API (HunyuanVideo)
+    i zapisuje wynik bezpośrednio do output_path."""
+    import base64
 
-# ---------------------------------------------------------------------------
-# GENEROWANIE SEGMENTÓW WIDEO
-# ---------------------------------------------------------------------------
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise ValueError("HF_TOKEN environment variable is not set")
+
+    # Map aspect ratio to width/height for HunyuanVideo
+    ratio_map = {
+        "9:16": (544, 960),
+        "16:9": (960, 544),
+        "1:1":  (720, 720),
+    }
+    width, height = ratio_map.get(aspect_ratio, (544, 960))
+
+    hf_model = os.getenv("HF_MODEL", "tencent/HunyuanVideo")
+    api_url = f"https://api-inference.huggingface.co/models/{hf_model}"
+
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "width": width,
+            "height": height,
+            "num_frames": int(os.getenv("HF_NUM_FRAMES", "49")),
+            "num_inference_steps": int(os.getenv("HF_INFERENCE_STEPS", "30")),
+        }
+    }
+
+    logger.info(f"🤗 Wysyłam żądanie do Hugging Face HunyuanVideo ({width}x{height})...")
+
+    def _call_hf():
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=300)
+        if resp.status_code == 503:
+            raise RuntimeError(f"HunyuanVideo model loading (503) – retry")
+        resp.raise_for_status()
+        return resp
+
+    response = retry_with_backoff("HunyuanVideo generate", _call_hf, max_retries=3, base_delay=30)
+
+    content_type = response.headers.get("Content-Type", "")
+    if "video" in content_type or "octet-stream" in content_type:
+        video_bytes = response.content
+    elif "application/json" in content_type:
+        data = response.json()
+        # Some HF endpoints return base64-encoded video
+        if isinstance(data, list) and data and "generated_video" in data[0]:
+            video_bytes = base64.b64decode(data[0]["generated_video"])
+        elif isinstance(data, dict) and "generated_video" in data:
+            video_bytes = base64.b64decode(data["generated_video"])
+        else:
+            raise ValueError(f"❌ HunyuanVideo returned unexpected JSON: {str(data)[:200]}")
+    else:
+        raise ValueError(f"❌ HunyuanVideo returned unexpected Content-Type: {content_type}")
+
+    with open(output_path, "wb") as f:
+        f.write(video_bytes)
+
+    logger.info(f"✅ HunyuanVideo segment zapisany: {output_path} ({len(video_bytes) // 1024} KB)")
+    return output_path
+
 
 def generate_video_segment(prompt, aspect_ratio="9:16"):
-    """Generuje pojedynczy klip wideo i zwraca lokalną ścieżkę tymczasową"""
-    logger.info(f"🎬 Generowanie segmentu: {prompt[:50]}...")
-    client = get_gemini_client()
-
-    # Throttle before submitting the Veo generation request
-    gemini_rate_limiter.wait_for_quota()
-
-    operation = retry_with_backoff(
-        "Veo generate_videos",
-        lambda: client.models.generate_videos(
-            model=MODEL,
-            prompt=prompt,
-            config=types.GenerateVideosConfig(
-                aspect_ratio=aspect_ratio,
-                duration_seconds=max(4, min(8, int(os.getenv("VEO_DURATION_SECONDS", "4" if FREE_TIER_MODE else "8")))),
-                resolution="1080p",
-            ),
-        )
-    )
-    
-    attempt = 0
-    total_wait_time = 0
-    MAX_TOTAL_WAIT_SECONDS = 300  # 5 minute hard limit
-    while not operation.done and attempt < 60:
-        wait_time = min(10 * (2 ** attempt), 120)  # Exponential: 10s, 20s, 40s, 80s, 120s
-        if total_wait_time + wait_time > MAX_TOTAL_WAIT_SECONDS:
-            raise TimeoutError(f"❌ Veo API timeout after {total_wait_time}s and {attempt} attempts")
-        logger.info(f"⏳ Veo API polling attempt {attempt+1}/60, waiting {wait_time}s (total: {total_wait_time}s)...")
-        time.sleep(wait_time)
-        operation = client.operations.get(operation)
-        total_wait_time += wait_time
-        attempt += 1
-        
-    if not operation.done:
-        raise TimeoutError(f"❌ Veo API timeout after {total_wait_time}s and {attempt} attempts")
-
-    result = operation.result
-    if not result or not hasattr(result, 'generated_videos') or not result.generated_videos:
-        raise ValueError(f"❌ Veo API returned invalid response: {result}")
-
-    video_uri = result.generated_videos[0].video.uri
-    
+    """Generuje pojedynczy klip wideo (HunyuanVideo) i zwraca lokalną ścieżkę tymczasową."""
+    logger.info(f"🎬 Generowanie segmentu HunyuanVideo: {prompt[:50]}...")
     temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
-    download_video_with_backoff(video_uri, temp_file)
+    generate_hunyuan_video_segment(prompt, temp_file, aspect_ratio)
     return temp_file
 
 
@@ -1501,21 +1499,16 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
             if _stage_done(stage_name):
                 if os.path.exists(stable_path):
-                    logger.info(f"⏩ Scena {key.upper()} już istnieje – pomijam Veo.")
+                    logger.info(f"⏩ Scena {key.upper()} już istnieje – pomijam HunyuanVideo.")
                     segment_files.append(stable_path)
                     continue
                 logger.info(f"⚠️  Plik sceny {key} zaginął ze STORAGE_DIR – regeneruję...")
 
             current_stage = stage_name
             save_checkpoint(job_id, current_stage, data={"topic": topic, "key": key})
-            logger.info(f"🎥 Generowanie sceny: {key.upper()}")
-            
-            file_path = generate_video_segment(prompt_text, aspect_ratio)
+            logger.info(f"🎥 Generowanie sceny HunyuanVideo: {key.upper()}")
 
-            import shutil
-            shutil.copy2(file_path, stable_path)
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            generate_hunyuan_video_segment(prompt_text, stable_path, aspect_ratio)
 
             segment_files.append(stable_path)
             logger.info(f"✅ Scena {key} gotowa")
@@ -1721,6 +1714,129 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
                 except Exception as e:
                     logger.warning(f"⚠️ Nie udało się usunąć {srt_file}: {e}")
 
+NARRATION_TEMPLATES = {
+    "hook": "Większość osób traci pieniądze na złym koncie. Czy i ty?",
+    "problem": "Banki promują oferty, które szybko tracą atrakcyjne warunki.",
+    "rozwiązanie": "Regularne porównywanie ofert pozwala znaleźć korzystniejsze opcje i zaoszczędzić na rachunkach."
+}
+
+def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=None):
+    """
+    Główny proces montażu sekwencji - uruchamiany w tle
+    """
+    STAGES = [
+        "hook_video",
+        "problem_video",
+        "solution_video",
+        "narration",
+        "assembly",
+        "upload",
+    ]
+
+    def _stage_done(stage):
+        """Return True when this stage was already completed before the resume point."""
+        if resume_from is None:
+            return False
+        try:
+            return STAGES.index(stage) < STAGES.index(resume_from)
+        except ValueError:
+            return False
+
+    job_start_time = time.time()
+    def check_job_timeout():
+        if time.time() - job_start_time > MAX_JOB_DURATION_SECONDS:
+            raise TimeoutError(f"Job exceeded the maximum execution limit of {MAX_JOB_DURATION_SECONDS} seconds.")
+
+    segment_files = []
+    audio_files_dict = {}
+    srt_file = None
+    current_stage = "init"
+    job_paused = False
+
+    try:
+        check_job_timeout()
+        topic = raw_data.get("topic", "Finanse osobiste")
+        raw_data = apply_optimization_rules(raw_data, topic)
+        aspect_ratio = raw_data.get("aspectRatio", "9:16")
+        host = raw_data.get("host", "localhost:5000")
+        custom_narration = raw_data.get("narration")
+        hashtags = raw_data.get("hashtags")
+        if not hashtags:
+            hashtags = build_hashtags(topic, custom_narration, MAX_HASHTAGS)
+
+        if resume_from:
+            logger.info(f"▶️  RESUME Job {job_id} | Wznawianie od etapu: {resume_from}")
+        else:
+            logger.info(f"🚀 START renderowania Job ID: {job_id} | Temat: {topic}")
+
+        if ENABLE_DRY_RUN:
+            logger.info("🧪 DRY_RUN enabled: skipping external providers and returning simulated success")
+            simulated_filename = f"dryrun_{job_id}.mp4"
+            simulated_path = os.path.join(STORAGE_DIR, simulated_filename)
+            with open(simulated_path, "wb") as f:
+                f.write(b"DRY_RUN")
+            video_url = f"https://{host}/videos/{simulated_filename}"
+            save_render_to_db(job_id, topic, 'success', video_url, video_duration=0.0)
+            if webhook_url:
+                send_webhook(webhook_url, {
+                    "event_type": "render.completed",
+                    "job_id": job_id,
+                    "status": "success",
+                    "video_url": video_url,
+                    # ... reszta payloadu dry_run bez zmian ...
+                    "dry_run": True,
+                })
+            METRICS["jobs_success"] += 1
+            return
+
+        prompts = {
+            "hook": f"Dynamic cinematic shot, extreme close up, shock and stress, concept of {topic}, corporate finance style, 4k, professional",
+            "problem": f"A person looking anxiously at bills and charts on a screen, dark moody lighting, financial stress, 4k, professional",
+            "rozwiązanie": f"Bright clean studio lighting, a smartphone screen displaying green rising financial growth charts, relief, 4k, professional"
+        }
+
+        logger.info("📋 Szablon: HOOK → PROBLEM → ROZWIĄZANIE")
+
+        stage_map = {
+            "hook":       "hook_video",
+            "problem":    "problem_video",
+            "rozwiązanie": "solution_video",
+        }
+
+        for key, prompt_text in prompts.items():
+            check_job_timeout()
+            stage_name = stage_map[key]
+
+            # POPRAWKA 1: Pliki dla wznawiania zadań MUSZĄ być w trwałym STORAGE_DIR, nie w ulotnym tempfile
+            stable_path = os.path.join(STORAGE_DIR, f"seg_{job_id}_{key}.mp4")
+
+            if _stage_done(stage_name):
+                if os.path.exists(stable_path):
+                    logger.info(f"⏩ Scena {key.upper()} już istnieje – pomijam HunyuanVideo.")
+                    segment_files.append(stable_path)
+                    continue
+                logger.info(f"⚠️  Plik sceny {key} zaginął ze STORAGE_DIR – regeneruję...")
+
+            current_stage = stage_name
+            save_checkpoint(job_id, current_stage, data={"topic": topic, "key": key})
+            logger.info(f"🎥 Generowanie sceny HunyuanVideo: {key.upper()}")
+
+            generate_hunyuan_video_segment(prompt_text, stable_path, aspect_ratio)
+
+            segment_files.append(stable_path)
+            logger.info(f"✅ Scena {key} gotowa")
+
+        logger.info(f"✅ Wszystkie 3 sceny gotowe")
+
+        check_job_timeout()
+        if not _stage_done("narration"):
+            current_stage = "narration"
+            save_checkpoint(job_id, current_stage, data={"topic": topic})
+            logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
+
+        narration_texts = custom_narration if custom_narration else NARRATION_TEMPLATES
+        audio_files_dict = generate_audio_narration(narration_texts, job_id)
+        logger.info(f"✅ Lektor wygenerowany")
 
 
 
@@ -2094,10 +2210,10 @@ def metrics():
 def index():
     """API Info"""
     return jsonify({
-        "name": "VeoVideo API",
-        "version": "3.1.0",
+        "name": "HunyuanVideo API",
+        "version": "4.0.0",
         "features": {
-            "veo_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE)",
+            "hunyuan_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE) via Hugging Face HunyuanVideo",
             "audio_narration": "ElevenLabs (głos Adam)",
             "subtitles": "Whisper API (automatyczna transkrypcja)",
             "watermark": "raport-finansowy24.pl (dolny róg)",
@@ -2133,7 +2249,7 @@ except Exception as val_err:
     # sys.exit(1)  # <--- COMMENTED OUT
 
 if __name__ == "__main__":
-    logger.info("🚀 Startup VeoVideo API v3.1 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
+    logger.info("🚀 Startup HunyuanVideo API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
     logger.info(f"📁 Storage: {STORAGE_DIR}")
     logger.info(f"🗄️  Database: {DB_PATH}")
     logger.info(f"🎙️ ElevenLabs: {'✅' if ELEVENLABS_API_KEY else '❌'}")
