@@ -666,7 +666,7 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
 
     logger.info(f"🤗 HunyuanVideo: generating {width}x{height} video for prompt: {prompt[:60]}...")
 
-    hf_client = Client("Kijai/HunyuanVideo_wrapper", hf_token=hf_token)
+    hf_client = Client("Kijai/HunyuanVideo_wrapper")
 
     logger.info("⏳ Calling HunyuanVideo predict()...")
     result = retry_with_backoff(
