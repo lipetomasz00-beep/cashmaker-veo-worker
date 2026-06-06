@@ -649,8 +649,11 @@ def get_render_from_db(job_id):
 # ---------------------------------------------------------------------------
 
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """Generate a video segment via HunyuanVideo on Hugging Face (Kijai/HunyuanVideo_wrapper)
+    """Generate a video segment via HunyuanVideo using Diffusers library
     and save it directly to output_path."""
+
+    from diffusers import HunyuanVideoPipeline
+    import torch
 
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
@@ -664,50 +667,34 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     }
     width, height = ratio_map.get(aspect_ratio, (544, 960))
 
-    logger.info(f"🤗 HunyuanVideo: generating {width}x{height} video for prompt: {prompt[:60]}...")
+    logger.info(f"🤗 HunyuanVideo (Diffusers): generating {width}x{height} video for prompt: {prompt[:60]}...")
 
-    hf_client = Client("Kijai/HunyuanVideo_wrapper")
-
-    logger.info("⏳ Calling HunyuanVideo predict()...")
-    result = retry_with_backoff(
-        "HunyuanVideo predict",
-        lambda: hf_client.predict(
-            prompt=prompt,
-            negative_prompt="low quality, blurry, static, text, watermark",
-            infer_steps=30,
-            guidance_scale=6.0,
-            width=width,
-            height=height,
-            num_frames=61,
-            api_name="/generate_video",
-        ),
+    # Initialize the pipeline
+    pipe = HunyuanVideoPipeline.from_pretrained(
+        "tencent/HunyuanVideo",
+        torch_dtype=torch.float16,
+        device_map="auto"
     )
 
-    # The Gradio client returns the local path to the generated video file
-    if isinstance(result, (list, tuple)):
-        video_path = result[0]
-    else:
-        video_path = result
+    logger.info("⏳ Generating video with HunyuanVideo...")
 
-    if not video_path or not os.path.exists(str(video_path)):
-        raise RuntimeError(
-            f"HunyuanVideo returned an invalid or missing file path: {video_path}"
-        )
+    # Generate video
+    output = pipe(
+        prompt=prompt,
+        height=height,
+        width=width,
+        num_frames=61,
+        num_inference_steps=30,
+    )
 
-    logger.info(f"✅ HunyuanVideo generation complete, local file: {video_path}")
+    # Save the generated video
+    video_frames = output.frames[0]  # Get first (and only) video
 
-    # Copy the generated video to the output path
-    shutil.copy(str(video_path), output_path)
+    # Convert frames to video file
+    import imageio
+    imageio.mimsave(output_path, video_frames, fps=24)
+
     logger.info(f"✅ Video saved to {output_path}")
-
-    # Clean up the local Gradio temp file
-    try:
-        os.remove(video_path)
-    except Exception as cleanup_err:
-        logger.warning(
-            f"⚠️ Could not remove local HunyuanVideo temp file {video_path}: {cleanup_err}"
-        )
-
     return output_path
 
 
