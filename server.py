@@ -312,14 +312,6 @@ def validate_required_env():
         except Exception as e:
             raise RuntimeError(f"OPENAI_API_KEY validation failed: {e}")
 
-        # Walidacja HF_TOKEN (wymagany do generowania wideo przez HunyuanVideo)
-        try:
-            hf_token = os.getenv("HF_TOKEN")
-            if not hf_token:
-                raise ValueError("HF_TOKEN is empty")
-            logger.info("✅ Klucz HF_TOKEN zweryfikowany pomyślnie.")
-        except Exception as e:
-            raise RuntimeError(f"HF_TOKEN validation failed: {e}")
     else:
         logger.info("🧪 DRY_RUN lub TESTING włączony - pomijam twardą walidację kluczy API.")
 
