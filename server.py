@@ -659,13 +659,16 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     def _call_api():
         try:
             from gradio_client import Client
+            import os
 
             hf_token = os.getenv("HF_TOKEN")
-            if not hf_token:
-                raise ValueError("HF_TOKEN environment variable is not set")
 
+            # Create client without token first
             client = Client("https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/")
-            client.login(hf_token=hf_token)
+
+            # Set token in headers if available
+            if hf_token:
+                client.session.headers.update({"Authorization": f"Bearer {hf_token}"})
 
             result = client.predict(
                 prompt=prompt,
