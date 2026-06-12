@@ -645,68 +645,61 @@ def get_render_from_db(job_id):
     return None
 
 # ---------------------------------------------------------------------------
-# GENEROWANIE SEGMENTÓW WIDEO (Hugging Face HunyuanVideo)
+# GENEROWANIE SEGMENTÓW WIDEO (Alibaba HappyHorse 1.0 via MuAPI.ai)
 # ---------------------------------------------------------------------------
 
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """Generate a video segment via HunyuanVideo using Replicate API
+    """Generate a video segment via Alibaba HappyHorse 1.0 using MuAPI.ai
     and save it directly to output_path."""
 
-    import replicate
+    muapi_key = os.getenv("MUAPI_API_KEY")
+    if not muapi_key:
+        raise ValueError("MUAPI_API_KEY environment variable is not set")
 
-    replicate_token = os.getenv("REPLICATE_API_TOKEN")
-    if not replicate_token:
-        raise ValueError("REPLICATE_API_TOKEN environment variable is not set")
+    logger.info(f"🎬 HappyHorse (MuAPI.ai): generating video for prompt: {prompt[:60]}...")
 
-    # Map aspect ratio to width/height
-    ratio_map = {
-        "9:16": (544, 960),
-        "16:9": (960, 544),
-        "1:1":  (720, 720),
-    }
-    width, height = ratio_map.get(aspect_ratio, (544, 960))
-
-    logger.info(f"🤗 HunyuanVideo (Replicate): generating {width}x{height} video for prompt: {prompt[:60]}...")
-
-    client = replicate.Client(api_token=replicate_token)
-
-    logger.info("⏳ Calling HunyuanVideo via Replicate...")
+    logger.info("⏳ Calling HappyHorse via MuAPI.ai...")
 
     def _call_api():
         try:
-            output = client.run(
-                "tencent/hunyuan-video:latest",
-                input={
-                    "prompt": prompt,
-                    "width": width,
-                    "height": height,
-                    "num_frames": 61,
-                    "num_inference_steps": 30,
-                }
+            headers = {
+                "Authorization": f"Bearer {muapi_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "alibaba/happyhorse-1.0",
+                "prompt": prompt,
+            }
+            response = requests.post(
+                "https://api.muapi.ai/v1/video/generate",
+                headers=headers,
+                json=payload,
+                timeout=600
             )
-            return output
+            if response.status_code == 503:
+                raise RuntimeError("Model overloaded – retry")
+            response.raise_for_status()
+            return response.json()
         except Exception as e:
             if "overloaded" in str(e).lower() or "busy" in str(e).lower():
                 raise RuntimeError("Model overloaded – retry")
             raise
 
-    result = retry_with_backoff("HunyuanVideo Replicate", _call_api, max_retries=3, base_delay=30)
+    result = retry_with_backoff("HappyHorse MuAPI", _call_api, max_retries=3, base_delay=30)
 
-    # result is a URL or file path from Replicate
-    if isinstance(result, str) and result.startswith("http"):
-        # Download from URL
-        response = requests.get(result, timeout=60)
-        response.raise_for_status()
-        with open(output_path, "wb") as f:
-            f.write(response.content)
-    elif isinstance(result, list) and result:
-        # Replicate returns list of URLs
-        response = requests.get(result[0], timeout=60)
-        response.raise_for_status()
-        with open(output_path, "wb") as f:
-            f.write(response.content)
+    # Extract video URL from result
+    if isinstance(result, dict) and "video_url" in result:
+        video_url = result["video_url"]
+    elif isinstance(result, dict) and "url" in result:
+        video_url = result["url"]
     else:
-        raise RuntimeError(f"Unexpected Replicate output format: {result}")
+        raise RuntimeError(f"Unexpected MuAPI output format: {result}")
+
+    # Download video from URL
+    response = requests.get(video_url, timeout=60)
+    response.raise_for_status()
+    with open(output_path, "wb") as f:
+        f.write(response.content)
 
     logger.info(f"✅ Video saved to {output_path}")
     return output_path
