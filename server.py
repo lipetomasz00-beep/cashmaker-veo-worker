@@ -652,22 +652,21 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     """Generate a video segment via HunyuanVideo Gradio Space
     and save it directly to output_path."""
 
-    from gradio_client import Client
-
-    hf_token = os.getenv("HF_TOKEN")
-    if not hf_token:
-        raise ValueError("HF_TOKEN environment variable is not set")
-
     logger.info(f"🎬 HunyuanVideo (Gradio Space): generating video for prompt: {prompt[:60]}...")
 
     logger.info("⏳ Calling HunyuanVideo Gradio Space...")
 
     def _call_api():
         try:
-            client = Client(
-                "https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/",
-                hf_token=hf_token
-            )
+            from gradio_client import Client
+
+            hf_token = os.getenv("HF_TOKEN")
+            if not hf_token:
+                raise ValueError("HF_TOKEN environment variable is not set")
+
+            client = Client("https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/")
+            client.login(hf_token=hf_token)
+
             result = client.predict(
                 prompt=prompt,
                 api_name="/generate_video"
