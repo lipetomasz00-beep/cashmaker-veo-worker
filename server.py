@@ -649,64 +649,48 @@ def get_render_from_db(job_id):
 # ---------------------------------------------------------------------------
 
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """Generate a video segment via HunyuanVideo using Replicate API
+    """Generate a video segment via HunyuanVideo Gradio Space
     and save it directly to output_path."""
 
-    import replicate
+    from gradio_client import Client
 
-    replicate_token = os.getenv("REPLICATE_API_TOKEN")
-    if not replicate_token:
-        raise ValueError("REPLICATE_API_TOKEN environment variable is not set")
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise ValueError("HF_TOKEN environment variable is not set")
 
-    # Map aspect ratio to width/height
-    ratio_map = {
-        "9:16": (544, 960),
-        "16:9": (960, 544),
-        "1:1":  (720, 720),
-    }
-    width, height = ratio_map.get(aspect_ratio, (544, 960))
+    logger.info(f"🎬 HunyuanVideo (Gradio Space): generating video for prompt: {prompt[:60]}...")
 
-    logger.info(f"🤗 HunyuanVideo (Replicate): generating {width}x{height} video for prompt: {prompt[:60]}...")
-
-    client = replicate.Client(api_token=replicate_token)
-
-    logger.info("⏳ Calling HunyuanVideo via Replicate...")
+    logger.info("⏳ Calling HunyuanVideo Gradio Space...")
 
     def _call_api():
         try:
-            output = client.run(
-                "tencent/hunyuan-video:latest",
-                input={
-                    "prompt": prompt,
-                    "width": width,
-                    "height": height,
-                    "num_frames": 61,
-                    "num_inference_steps": 30,
-                }
+            client = Client(
+                "https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/",
+                hf_token=hf_token
             )
-            return output
+            result = client.predict(
+                prompt=prompt,
+                api_name="/generate_video"
+            )
+            return result
         except Exception as e:
-            if "overloaded" in str(e).lower() or "busy" in str(e).lower():
-                raise RuntimeError("Model overloaded – retry")
+            if "overloaded" in str(e).lower() or "busy" in str(e).lower() or "503" in str(e):
+                raise RuntimeError("Space overloaded – retry")
             raise
 
-    result = retry_with_backoff("HunyuanVideo Replicate", _call_api, max_retries=3, base_delay=30)
+    result = retry_with_backoff("HunyuanVideo Gradio", _call_api, max_retries=3, base_delay=30)
 
-    # result is a URL or file path from Replicate
-    if isinstance(result, str) and result.startswith("http"):
-        # Download from URL
-        response = requests.get(result, timeout=60)
-        response.raise_for_status()
-        with open(output_path, "wb") as f:
-            f.write(response.content)
-    elif isinstance(result, list) and result:
-        # Replicate returns list of URLs
-        response = requests.get(result[0], timeout=60)
-        response.raise_for_status()
-        with open(output_path, "wb") as f:
-            f.write(response.content)
+    # Extract video path from result
+    if isinstance(result, (list, tuple)) and result:
+        video_path = result[0]
+    elif isinstance(result, str):
+        video_path = result
     else:
-        raise RuntimeError(f"Unexpected Replicate output format: {result}")
+        raise RuntimeError(f"Unexpected Gradio output format: {result}")
+
+    # Copy video to output_path
+    import shutil
+    shutil.copy(str(video_path), output_path)
 
     logger.info(f"✅ Video saved to {output_path}")
     return output_path
