@@ -649,12 +649,18 @@ def get_render_from_db(job_id):
 # ---------------------------------------------------------------------------
 
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """Generate a video segment via HunyuanVideo Gradio Space
-    and save it directly to output_path."""
+    """Generate a video segment via LTX 2.3 Gradio Space and save it directly to output_path."""
 
-    logger.info(f"🎬 HunyuanVideo (Gradio Space): generating video for prompt: {prompt[:60]}...")
+    logger.info(f"🎬 LTX 2.3 (Gradio Space): generating video for prompt: {prompt[:60]}...")
+    logger.info("⏳ Calling LTX 2.3 Gradio Space...")
 
-    logger.info("⏳ Calling HunyuanVideo Gradio Space...")
+    # Parse aspect ratio to width/height
+    if aspect_ratio == "9:16":
+        width, height = 512, 768
+    elif aspect_ratio == "16:9":
+        width, height = 768, 512
+    else:
+        width, height = 512, 768
 
     def _call_api():
         try:
@@ -662,16 +668,31 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
             import os
 
             hf_token = os.getenv("HF_TOKEN")
+            if not hf_token:
+                raise ValueError("HF_TOKEN environment variable is not set")
 
-            # Create client with hf_token parameter (correct API for gradio_client >= 0.15.0)
+            # Create client with hf_token parameter
             client = Client(
                 "https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/",
                 hf_token=hf_token
             )
 
+            # Call /handler endpoint with 13 parameters
             result = client.predict(
-                prompt=prompt,
-                api_name="/generate_video"
+                param_0=prompt,                    # Main prompt (text)
+                param_1="Balanced",                # Quality preset: 'Fast', 'Balanced', 'Quality'
+                param_2=width,                     # Width (e.g., 512)
+                param_3=height,                    # Height (e.g., 768)
+                param_4=5,                         # Duration in seconds
+                param_5=24,                        # FPS (frames per second)
+                param_6=42,                        # Seed
+                param_7=True,                      # Random seed each run
+                param_8="blurry, low quality",     # Negative prompt
+                param_9="none",                    # Camera motion: 'none', 'static', 'dolly-in'
+                param_10=0.8,                      # Camera motion strength
+                param_11=False,                    # Enable IC-LoRA-Detailer
+                param_12=0.5,                      # Detailer strength
+                api_name="/handler"
             )
             return result
         except Exception as e:
@@ -679,7 +700,7 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
                 raise RuntimeError("Space overloaded – retry")
             raise
 
-    result = retry_with_backoff("HunyuanVideo Gradio", _call_api, max_retries=3, base_delay=30)
+    result = retry_with_backoff("LTX 2.3 Gradio", _call_api, max_retries=3, base_delay=30)
 
     # Extract video path from result
     if isinstance(result, (list, tuple)) and result:
@@ -687,13 +708,22 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     elif isinstance(result, str):
         video_path = result
     else:
-        raise RuntimeError(f"Unexpected Gradio output format: {result}")
+        raise RuntimeError(f"Unexpected result format from LTX 2.3: {result}")
 
-    # Copy video to output_path
-    import shutil
-    shutil.copy(str(video_path), output_path)
+    # Download video from Gradio temp URL to output_path
+    if video_path.startswith("http"):
+        logger.info(f"📥 Downloading video from {video_path[:80]}...")
+        response = requests.get(video_path, timeout=300)
+        response.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+        logger.info(f"✅ Video saved to {output_path}")
+    else:
+        # Local file path
+        import shutil
+        shutil.copy(video_path, output_path)
+        logger.info(f"✅ Video copied to {output_path}")
 
-    logger.info(f"✅ Video saved to {output_path}")
     return output_path
 
 
