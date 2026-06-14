@@ -45,6 +45,7 @@ ENABLE_DRY_RUN = os.getenv("ENABLE_DRY_RUN", "false").lower() == "true"
 FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "8"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("IDEMPOTENCY_TTL_SECONDS", "3600"))
+SKIP_NARRATION = os.getenv("SKIP_NARRATION", "false").lower() == "true"
 
 # Auto-retry configuration for paused jobs
 AUTO_RETRY_ENABLED = os.getenv("AUTO_RETRY_ENABLED", "true").lower() == "true"
@@ -177,7 +178,10 @@ def validate_required_env():
         raise RuntimeError("System dependency 'ffprobe' is missing from PATH. Install it first.")
 
     # 2. Walidacja obecności wymaganych zmiennych
-    required = ["HF_TOKEN", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
+    # ELEVENLABS_API_KEY is optional when SKIP_NARRATION=true
+    required = ["HF_TOKEN", "OPENAI_API_KEY", "WORKER_API_KEY"]
+    if not SKIP_NARRATION:
+        required.append("ELEVENLABS_API_KEY")
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         raise RuntimeError(
@@ -197,13 +201,16 @@ def validate_required_env():
         except Exception as e:
             raise RuntimeError(f"HF_TOKEN validation failed: {e}")
 
-        # Walidacja ElevenLabs
-        try:
-            el_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-            el_client.voices.get_all()
-            logger.info("✅ Klucz ELEVENLABS_API_KEY zweryfikowany pomyślnie.")
-        except Exception as e:
-            raise RuntimeError(f"ELEVENLABS_API_KEY validation failed: {e}")
+        # Walidacja ElevenLabs (pomijamy gdy SKIP_NARRATION=true)
+        if not SKIP_NARRATION:
+            try:
+                el_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+                el_client.voices.get_all()
+                logger.info("✅ Klucz ELEVENLABS_API_KEY zweryfikowany pomyślnie.")
+            except Exception as e:
+                raise RuntimeError(f"ELEVENLABS_API_KEY validation failed: {e}")
+        else:
+            logger.info("⏭️  SKIP_NARRATION=true – pomijam walidację ELEVENLABS_API_KEY.")
 
         # Walidacja OpenAI
         try:
@@ -876,6 +883,52 @@ def generate_audio_narration(narration_texts, job_id):
 
     return audio_files
 
+
+def generate_silent_audio_narration(narration_texts, job_id, duration_per_scene=5.0):
+    """Create silent MP3 placeholder files instead of calling ElevenLabs.
+
+    Used when SKIP_NARRATION=true so the rest of the pipeline (assembly,
+    speed-adjustment, FFmpeg concat) can proceed without audio.  Each scene
+    gets a silent MP3 of `duration_per_scene` seconds so that
+    calculate_video_speed() has valid durations to work with.
+    """
+    audio_files = {}
+    for scene_key in narration_texts.keys():
+        audio_file = os.path.join(tempfile.gettempdir(), f"narration_{scene_key}_{job_id}.mp3")
+
+        if os.path.exists(audio_file):
+            logger.info(f"⏩ Cicha ścieżka {scene_key} już istnieje – pomijam.")
+            duration = get_audio_duration(audio_file)
+            audio_files[scene_key] = {"path": audio_file, "duration": duration, "text": narration_texts[scene_key]}
+            continue
+
+        logger.info(f"🔇 Tworzę cichą ścieżkę zastępczą: {scene_key} ({duration_per_scene}s)")
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=mono",
+            "-t", str(duration_per_scene),
+            "-c:a", "libmp3lame", "-q:a", "9",
+            audio_file,
+        ]
+        try:
+            subprocess.run(
+                ffmpeg_cmd, check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30
+            )
+            logger.info(f"✅ Cicha ścieżka {scene_key} zapisana: {audio_file}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.error(f"❌ Nie udało się utworzyć cichej ścieżki {scene_key}: {e}")
+            raise RuntimeError(f"Failed to create silent audio placeholder for {scene_key}: {e}") from e
+
+        audio_files[scene_key] = {
+            "path": audio_file,
+            "duration": duration_per_scene,
+            "text": narration_texts[scene_key],
+        }
+
+    return audio_files
+
+
 # ---------------------------------------------------------------------------
 # NAPISY: GENEROWANIE SRT Z AUDIO (Whisper API)
 # ---------------------------------------------------------------------------
@@ -1156,68 +1209,94 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
     logger.info(f"✅ Wideo połączone: {concat_output}")
     
     logger.info("🎙️ Etap 2: Miksowanie audio (lektory)...")
-    
+
     combined_audio = os.path.join(tempfile.gettempdir(), f"combined_audio_{job_id}.mp3")
-    
     audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_{job_id}.txt")
-    with open(audio_list_file, "w") as f:
-        for scene_key in ["hook", "problem", "rozwiązanie"]:
-            if scene_key in audio_files:
-                f.write(f"file '{audio_files[scene_key]['path']}'\n")
-    
-    ffmpeg_audio_concat = [
-        'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
-        '-c:a', 'libmp3lame', '-q:a', '4',
-        combined_audio
+
+    # Collect audio entries that actually exist on disk
+    audio_entries = [
+        audio_files[k]["path"]
+        for k in ["hook", "problem", "rozwiązanie"]
+        if k in audio_files and os.path.exists(audio_files[k]["path"])
     ]
-    subprocess.run(ffmpeg_audio_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-    logger.info(f"✅ Lektory połączone: {combined_audio}")
-    
+    has_audio = bool(audio_entries)
+
+    if has_audio:
+        with open(audio_list_file, "w") as f:
+            for path in audio_entries:
+                f.write(f"file '{path}'\n")
+
+        ffmpeg_audio_concat = [
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
+            '-c:a', 'libmp3lame', '-q:a', '4',
+            combined_audio
+        ]
+        subprocess.run(ffmpeg_audio_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        logger.info(f"✅ Lektory połączone: {combined_audio}")
+    else:
+        logger.info("⏭️  Brak ścieżek audio – montaż wideo bez dźwięku.")
+
     logger.info("🎨 Etap 3: Miksowanie wideo + audio + napisy...")
-    
+
     # BŁĄD LOGICZNY USUNIĘTY: Skoro speed robimy w innej funkcji, tu dajemy zwykłe kopiowanie strumienia video (bez setpts)
     # Zostawiamy po prostu wejście wideo bez modyfikacji czasu, żeby nie podwoić przyspieszenia.
     video_filter = "[0:v]copy" if srt_file is None else "[0:v]format=yuv420p"
-    
+
     # Budujemy łańcuch filtrów
     filters = []
-    
+
     if srt_file and os.path.exists(srt_file):
         srt_path_escaped = srt_file.replace("\\", "\\\\").replace(":", "\\:")
         # Eleganckie, wyraźne napisy dopasowane do profesjonalnego brandingu
         filters.append(f"subtitles='{srt_path_escaped}':force_style='FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2,Shadow=0'")
         logger.info(f"✅ Napisy będą wypalane")
-    
+
     watermark_text = "raport-finansowy24.pl"
     filters.append(f"drawtext=text='{watermark_text}':x=w-text_w-20:y=h-text_h-20:fontsize=24:fontcolor=white@0.7:box=1:boxcolor=black@0.5")
-    
+
     # Łączymy filtry wideo przecinkami
     final_video_filter = ",".join(filters)
-    
-    ffmpeg_final_cmd = [
-        'ffmpeg', '-y',
-        '-i', concat_output,
-        '-i', combined_audio,
-        '-filter_complex',
-        f"[0:v]{final_video_filter}[vout];[1:a]volume=1.0[aout]",
-        '-map', '[vout]', '-map', '[aout]',
-        # STABILNOŚĆ: ultrafast i threads=2 zapobiegną zabiciu procesu przez Gunicorn
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
-        '-c:a', 'aac', '-b:a', '128k',
-        output_path
-    ]
-    
+
+    if has_audio:
+        ffmpeg_final_cmd = [
+            'ffmpeg', '-y',
+            '-i', concat_output,
+            '-i', combined_audio,
+            '-filter_complex',
+            f"[0:v]{final_video_filter}[vout];[1:a]volume=1.0[aout]",
+            '-map', '[vout]', '-map', '[aout]',
+            # STABILNOŚĆ: ultrafast i threads=2 zapobiegną zabiciu procesu przez Gunicorn
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            output_path
+        ]
+    else:
+        # No audio track – video-only output (SKIP_NARRATION mode)
+        ffmpeg_final_cmd = [
+            'ffmpeg', '-y',
+            '-i', concat_output,
+            '-filter_complex',
+            f"[0:v]{final_video_filter}[vout]",
+            '-map', '[vout]',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
+            '-an',
+            output_path
+        ]
+
     logger.info("🔄 Kodowanie finale (może potrwać trochę)...")
     subprocess.run(ffmpeg_final_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
     logger.info(f"✅ Finalne wideo: {output_path}")
-    
-    for file in [list_file_path, audio_list_file, concat_output, combined_audio]:
+
+    cleanup_files = [list_file_path, concat_output]
+    if has_audio:
+        cleanup_files += [audio_list_file, combined_audio]
+    for file in cleanup_files:
         if os.path.exists(file):
             try:
                 os.remove(file)
             except Exception as e:
                 logger.warning(f"⚠️ Nie udało się usunąć {file}: {e}")
-    
+
     return output_path
 
 # ---------------------------------------------------------------------------
@@ -1342,50 +1421,60 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         if not _stage_done("narration"):
             current_stage = "narration"
             save_checkpoint(job_id, current_stage, data={"topic": topic})
-            logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
+            if SKIP_NARRATION:
+                logger.info("⏭️  SKIP_NARRATION=true – pomijam ElevenLabs, tworzę ciche ścieżki zastępcze.")
+            else:
+                logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
 
         narration_texts = custom_narration if custom_narration else NARRATION_TEMPLATES
-        audio_files_dict = generate_audio_narration(narration_texts, job_id)
-        logger.info(f"✅ Lektor wygenerowany")
+        if SKIP_NARRATION:
+            audio_files_dict = generate_silent_audio_narration(narration_texts, job_id)
+            logger.info("✅ Ciche ścieżki zastępcze gotowe (SKIP_NARRATION=true)")
+        else:
+            audio_files_dict = generate_audio_narration(narration_texts, job_id)
+            logger.info(f"✅ Lektor wygenerowany")
 
         check_job_timeout()
         srt_file = None
-        
-        # Generowanie napisów
-        combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
-        audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_trans_{job_id}.txt")
 
-        try:
-            with open(audio_list_file, "w") as f:
-                for scene_key in ["hook", "problem", "rozwiązanie"]:
-                    if scene_key in audio_files_dict:
-                        f.write(f"file '{audio_files_dict[scene_key]['path']}'\n")
+        # Generowanie napisów (pomijamy gdy SKIP_NARRATION=true – brak realnego audio do transkrypcji)
+        if SKIP_NARRATION:
+            logger.info("⏭️  SKIP_NARRATION=true – pomijam generowanie napisów (Whisper).")
+        else:
+            combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
+            audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_trans_{job_id}.txt")
 
-            ffmpeg_concat = [
-                'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
-                '-c:a', 'libmp3lame', '-q:a', '4',
-                combined_for_transcription
-            ]
-            
-            # ZABEZPIECZENIE: Try-except dla łączenia audio
             try:
-                subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-                srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
-            except subprocess.CalledProcessError as e:
-                logger.error(f"❌ Błąd FFmpeg przy łączeniu audio dla Whispera: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'Brak'}")
-                srt_file = None
-            except subprocess.TimeoutExpired:
-                logger.error("❌ Błąd: Timeout FFmpeg przy łączeniu audio dla Whispera.")
-                srt_file = None
+                with open(audio_list_file, "w") as f:
+                    for scene_key in ["hook", "problem", "rozwiązanie"]:
+                        if scene_key in audio_files_dict:
+                            f.write(f"file '{audio_files_dict[scene_key]['path']}'\n")
 
-        except Exception as e:
-            logger.warning(f"⚠️ Napisy niedostępne: {e}")
-            srt_file = None
-        finally:
-            if os.path.exists(combined_for_transcription):
-                os.remove(combined_for_transcription)
-            if os.path.exists(audio_list_file):
-                os.remove(audio_list_file)
+                ffmpeg_concat = [
+                    'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
+                    '-c:a', 'libmp3lame', '-q:a', '4',
+                    combined_for_transcription
+                ]
+
+                # ZABEZPIECZENIE: Try-except dla łączenia audio
+                try:
+                    subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                    srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"❌ Błąd FFmpeg przy łączeniu audio dla Whispera: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'Brak'}")
+                    srt_file = None
+                except subprocess.TimeoutExpired:
+                    logger.error("❌ Błąd: Timeout FFmpeg przy łączeniu audio dla Whispera.")
+                    srt_file = None
+
+            except Exception as e:
+                logger.warning(f"⚠️ Napisy niedostępne: {e}")
+                srt_file = None
+            finally:
+                if os.path.exists(combined_for_transcription):
+                    os.remove(combined_for_transcription)
+                if os.path.exists(audio_list_file):
+                    os.remove(audio_list_file)
 
         check_job_timeout()
         logger.info("⏱️ Etap automatycznego dopasowania długości...")
