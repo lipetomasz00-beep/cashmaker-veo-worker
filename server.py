@@ -681,7 +681,7 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
                 "https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/"
             )
 
-            # Call /handler endpoint with 13 parameters
+            # Call /predict endpoint with 13 parameters
             result = client.predict(
                 param_0=prompt,                    # Main prompt (text)
                 param_1="Balanced",                # Quality preset: 'Fast', 'Balanced', 'Quality'
@@ -696,7 +696,7 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
                 param_10=0.8,                      # Camera motion strength
                 param_11=False,                    # Enable IC-LoRA-Detailer
                 param_12=0.5,                      # Detailer strength
-                api_name="/handler"
+                api_name="/predict"
             )
             return result
         except Exception as e:
