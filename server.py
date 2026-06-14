@@ -46,6 +46,7 @@ FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "8"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("IDEMPOTENCY_TTL_SECONDS", "3600"))
 SKIP_NARRATION = os.getenv("SKIP_NARRATION", "false").lower() == "true"
+VEO_DURATION_SECONDS = int(os.getenv("VEO_DURATION_SECONDS", "6"))  # Per-scene GPU duration (6s × 3 scenes = 18s total)
 
 # Auto-retry configuration for paused jobs
 AUTO_RETRY_ENABLED = os.getenv("AUTO_RETRY_ENABLED", "true").lower() == "true"
@@ -434,7 +435,7 @@ def apply_optimization_rules(raw_data, topic):
     if vtr and vtr < 0.20:
         narration["problem"] = "Najczęstszy błąd rynkowy to wybór oferty bez dokładnej weryfikacji parametrów."
         narration["rozwiązanie"] = "Dostęp do rzetelnych danych pozwala podjąć decyzję w oparciu o czyste liczby, a nie obietnice."
-        raw_data["targetDuration"] = 12
+        raw_data["targetDuration"] = 18
         optimizations.append("low_vtr_shorter_story")
 
     if narration:
@@ -715,7 +716,7 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
                     prompt,                          # [2] Prompt
                     6,                               # [3] Inference Steps
                     "blurry, low quality, distorted, watermark",  # [4] Negative Prompt
-                    5,                               # [5] Duration in seconds
+                    VEO_DURATION_SECONDS,            # [5] Duration in seconds
                     3.5,                             # [6] Guidance Scale - high noise
                     1,                               # [7] Guidance Scale 2 - low noise
                     42,                              # [8] Seed
@@ -884,7 +885,7 @@ def generate_audio_narration(narration_texts, job_id):
     return audio_files
 
 
-def generate_silent_audio_narration(narration_texts, job_id, duration_per_scene=5.0):
+def generate_silent_audio_narration(narration_texts, job_id, duration_per_scene=6.0):
     """Create silent MP3 placeholder files instead of calling ElevenLabs.
 
     Used when SKIP_NARRATION=true so the rest of the pipeline (assembly,
@@ -1128,7 +1129,7 @@ def get_video_duration(video_file):
 # AUTOMATYCZNE DOPASOWANIE DŁUGOŚCI
 # ---------------------------------------------------------------------------
 
-def calculate_video_speed(audio_files, target_duration=15):
+def calculate_video_speed(audio_files, target_duration=18):
     """Obliczenie prędkości playbacku aby zmieścić się w target_duration"""
     total_audio_duration = sum(audio["duration"] for audio in audio_files.values())
     total_audio_duration += 2  # Buffer dla CTA
@@ -1479,8 +1480,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         check_job_timeout()
         logger.info("⏱️ Etap automatycznego dopasowania długości...")
 
-        target_duration = int(raw_data.get("targetDuration", 15))
-        speed = calculate_video_speed(audio_files_dict, target_duration)
+        target_duration = int(raw_data.get("targetDuration", 18))
 
         if speed != 1.0:
             logger.info(f"⚡ Dopasowywanie prędkości wideo do {speed:.2f}x...")
