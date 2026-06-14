@@ -57,6 +57,7 @@ AUTO_RETRY_MAX_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_MAX_DELAY_SECONDS", "60
 # Hard execution timeout configuration for background jobs
 MAX_JOB_DURATION_SECONDS = int(os.getenv("MAX_JOB_DURATION_SECONDS", "1200"))  # 10 minutes
 IS_TESTING = os.getenv("TESTING", "false").lower() == "true"
+DISABLE_CLEANUP = os.getenv("DISABLE_CLEANUP", "false").lower() == "true"
 
 RATE_LIMIT_WINDOW = {}
 RATE_LIMIT_LOCK = threading.Lock()
@@ -1607,7 +1608,8 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         if job_paused:
             logger.info("⏸️ Job paused – zachowuję pliki w STORAGE_DIR dla wznowienia.")
         else:
-            logger.info("🧹 Czyszczenie plików...")
+            if not DISABLE_CLEANUP:
+                logger.info("🧹 Czyszczenie plików...")
             for path in segment_files:
                 # Nie usuwamy głównych segmentów ze STORAGE_DIR od razu, zostawiamy to funkcji cleanup_old_files() 
                 # Zabezpiecza to pliki, gdyby API wznawiania ich wciąż potrzebowało w tle
