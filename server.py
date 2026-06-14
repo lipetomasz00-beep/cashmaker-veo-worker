@@ -699,7 +699,7 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
                 # [10] Video Quality (number)
                 # [11] Scheduler (string)
                 # [12] Flow Shift (number)
-                # [13] Video Fluidity/FPS (string)
+                # [13] Video Fluidity/FPS (number)
                 # [14] Safe Mode (boolean)
                 # [15] Display result (boolean)
                 result = client.predict(
@@ -716,7 +716,7 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
                     6,                               # [10] Video Quality
                     "UniPCMultistep",                # [11] Scheduler
                     3,                               # [12] Flow Shift
-                    "16",                            # [13] Video Fluidity/FPS
+                    16,                              # [13] Video Fluidity/FPS
                     True,                            # [14] Safe Mode
                     True,                            # [15] Display result
                     api_name="/generate_video"
