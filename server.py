@@ -1481,6 +1481,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         logger.info("⏱️ Etap automatycznego dopasowania długości...")
 
         target_duration = int(raw_data.get("targetDuration", 18))
+        speed = calculate_video_speed(audio_files_dict, target_duration)
 
         if speed != 1.0:
             logger.info(f"⚡ Dopasowywanie prędkości wideo do {speed:.2f}x...")
