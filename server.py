@@ -1523,7 +1523,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         # ZABEZPIECZENIE: Łapanie błędu krytycznego podczas finałowego sklejania
         try:
             subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-            os.replace(final_with_endscreen, final_output_path)
+            shutil.move(final_with_endscreen, final_output_path)
             logger.info(f"✅ Plansza końcowa dodana")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.error(f"❌ Nie udało się dodać planszy końcowej. Zostawiam wideo bez niej. Błąd: {e}")
