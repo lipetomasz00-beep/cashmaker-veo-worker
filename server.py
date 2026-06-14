@@ -48,6 +48,10 @@ IDEMPOTENCY_TTL_SECONDS = int(os.getenv("IDEMPOTENCY_TTL_SECONDS", "3600"))
 SKIP_NARRATION = os.getenv("SKIP_NARRATION", "false").lower() == "true"
 VEO_DURATION_SECONDS = int(os.getenv("VEO_DURATION_SECONDS", "6"))  # Per-scene GPU duration (6s × 3 scenes = 18s total)
 
+# NAVA text-to-video configuration
+NAVA_ENABLED = os.getenv("NAVA_ENABLED", "false").lower() == "true"
+NAVA_SPACE_ID = os.getenv("NAVA_SPACE_ID", "prithivMLmods/NAVA-Text-to-Video")
+
 # Auto-retry configuration for paused jobs
 AUTO_RETRY_ENABLED = os.getenv("AUTO_RETRY_ENABLED", "false").lower() == "true"
 AUTO_RETRY_MAX_ATTEMPTS = int(os.getenv("AUTO_RETRY_MAX_ATTEMPTS", "3"))
@@ -804,6 +808,134 @@ def _get_bucket_client():
         aws_secret_access_key=os.getenv("BUCKET_SECRET_ACCESS_KEY"),
         region_name=os.getenv("BUCKET_REGION", "auto"),
     )
+
+
+def _upload_video_to_s3(local_path, object_key):
+    """Upload a local video file to the S3 bucket and return its public URL.
+
+    Returns the public URL string on success, or raises on failure.
+    """
+    bucket_name = os.getenv("BUCKET_NAME")
+    if not bucket_name:
+        raise ValueError("BUCKET_NAME environment variable is not set")
+
+    s3 = _get_bucket_client()
+    s3.upload_file(
+        local_path,
+        bucket_name,
+        object_key,
+        ExtraArgs={"ContentType": "video/mp4"},
+    )
+
+    endpoint = os.getenv("BUCKET_ENDPOINT_URL", "").rstrip("/")
+    if endpoint:
+        public_url = f"{endpoint}/{bucket_name}/{object_key}"
+    else:
+        region = os.getenv("BUCKET_REGION", "us-east-1")
+        public_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{object_key}"
+
+    logger.info(f"☁️  Uploaded {object_key} → {public_url}")
+    return public_url
+
+
+def generate_nava_video(
+    prompt,
+    duration_sec=6.0,
+    aspect_ratio="1:1 (960×960)",
+    steps=20.0,
+):
+    """Generate a video using the NAVA Gradio Space and upload it to S3.
+
+    Parameters
+    ----------
+    prompt : str
+        Text description of the video to generate.
+    duration_sec : float
+        Duration of the generated video in seconds (4–6 s accepted by NAVA).
+    aspect_ratio : str
+        Aspect ratio string as expected by the NAVA Space UI
+        (e.g. "1:1 (960×960)", "16:9 (848×480)", "9:16 (480×848)").
+    steps : float
+        Number of inference steps (default 20).
+
+    Returns
+    -------
+    str
+        Public URL of the uploaded video.
+    """
+    if not NAVA_ENABLED:
+        raise RuntimeError(
+            "NAVA is disabled. Set NAVA_ENABLED=true to enable this feature."
+        )
+
+    logger.info(
+        f"🎬 NAVA: generating video | prompt={prompt[:60]!r} "
+        f"duration={duration_sec}s aspect={aspect_ratio} steps={steps}"
+    )
+
+    def _call_nava_api():
+        from gradio_client import Client
+        from huggingface_hub import login
+
+        hf_token = os.getenv("HF_TOKEN")
+        if not hf_token:
+            raise ValueError("HF_TOKEN environment variable is not set")
+
+        login(token=hf_token)
+
+        client = Client(f"https://huggingface.co/spaces/{NAVA_SPACE_ID}")
+
+        result = client.predict(
+            prompt,          # Prompt (str)
+            duration_sec,    # Duration in seconds (float)
+            aspect_ratio,    # Aspect ratio (str)
+            steps,           # Inference steps (float)
+            api_name="/generate",
+        )
+        return result
+
+    result = retry_with_backoff("NAVA Gradio", _call_nava_api, max_retries=3, base_delay=30)
+
+    # The NAVA Space returns the video file path/URL directly.
+    video_path = None
+    if isinstance(result, dict):
+        video_path = result.get("video") or result.get("path") or result.get("url")
+    elif isinstance(result, (list, tuple)) and len(result) >= 1:
+        candidate = result[0]
+        if isinstance(candidate, dict):
+            video_path = candidate.get("video") or candidate.get("path") or candidate.get("url")
+        elif isinstance(candidate, str) and candidate:
+            video_path = candidate
+    elif isinstance(result, str) and result:
+        video_path = result
+
+    if not video_path:
+        raise RuntimeError(f"No video path found in NAVA /generate response: {result}")
+
+    # Download or copy the video to a local temp file
+    local_tmp = os.path.join(tempfile.gettempdir(), f"nava_{uuid.uuid4().hex}.mp4")
+    if video_path.startswith("http"):
+        logger.info(f"📥 Downloading NAVA video from {video_path[:80]}...")
+        resp = requests.get(video_path, timeout=300)
+        resp.raise_for_status()
+        with open(local_tmp, "wb") as fh:
+            fh.write(resp.content)
+    else:
+        shutil.copy(video_path, local_tmp)
+
+    logger.info(f"✅ NAVA video saved locally: {local_tmp}")
+
+    # Upload to S3 and return the public URL
+    object_key = f"nava/{uuid.uuid4().hex}.mp4"
+    try:
+        public_url = _upload_video_to_s3(local_tmp, object_key)
+    finally:
+        try:
+            os.unlink(local_tmp)
+        except OSError:
+            pass
+
+    return public_url
 
 
 # ---------------------------------------------------------------------------
@@ -1930,14 +2062,107 @@ def metrics():
     return jsonify(METRICS), 200
 
 
+@app.route("/nava-generate", methods=["POST"])
+def nava_generate():
+    """POST /nava-generate
+
+    Generate a short video using the NAVA text-to-video model
+    (prithivMLmods/NAVA-Text-to-Video) and return a public S3 URL.
+
+    Request body (JSON):
+        prompt       (str,   required) – text description of the video
+        duration_sec (float, optional, default 6) – video length in seconds (4–6)
+        aspect_ratio (str,   optional, default "1:1 (960×960)") – output aspect ratio
+        steps        (float, optional, default 20) – number of inference steps
+        webhookUrl   (str,   optional) – URL to POST a completion notification to
+
+    Response 200:
+        { "video_url": "<public S3 URL>" }
+
+    Response 503:
+        { "error": "NAVA is disabled …" }
+    """
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    if not NAVA_ENABLED:
+        return jsonify({
+            "error": "NAVA is disabled on this instance. Set NAVA_ENABLED=true to enable."
+        }), 503
+
+    data = request.json or {}
+
+    # Validate webhook URL if provided
+    webhook_url = data.get("webhookUrl")
+    if webhook_url and not is_valid_public_url(webhook_url):
+        return jsonify({"error": "Invalid or unsafe 'webhookUrl' (SSRF protection)"}), 400
+
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "Missing or empty 'prompt'"}), 400
+
+    try:
+        duration_sec = float(data.get("duration_sec", 6))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'duration_sec' must be a number"}), 400
+
+    if not (4 <= duration_sec <= 6):
+        return jsonify({"error": "'duration_sec' must be between 4 and 6"}), 400
+
+    aspect_ratio = str(data.get("aspect_ratio", "1:1 (960×960)"))
+
+    try:
+        steps = float(data.get("steps", 20))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'steps' must be a number"}), 400
+
+    logger.info(
+        f"📥 NAVA request | prompt={prompt[:60]!r} duration={duration_sec}s "
+        f"aspect={aspect_ratio} steps={steps}"
+    )
+
+    try:
+        video_url = generate_nava_video(
+            prompt=prompt,
+            duration_sec=duration_sec,
+            aspect_ratio=aspect_ratio,
+            steps=steps,
+        )
+    except RuntimeError as exc:
+        logger.error(f"❌ NAVA generation failed: {exc}")
+        return jsonify({"error": str(exc)}), 502
+    except Exception as exc:
+        logger.error(f"❌ NAVA unexpected error: {exc}", exc_info=True)
+        return jsonify({"error": "Internal server error during NAVA generation"}), 500
+
+    logger.info(f"✅ NAVA video ready: {video_url}")
+
+    if webhook_url:
+        try:
+            send_webhook(webhook_url, {
+                "event_type": "nava.completed",
+                "status": "success",
+                "video_url": video_url,
+                "prompt": prompt,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            logger.info("🔔 NAVA webhook sent")
+        except Exception as exc:
+            logger.warning(f"⚠️ NAVA webhook failed: {exc}")
+
+    return jsonify({"video_url": video_url}), 200
+
+
 @app.route("/", methods=["GET"])
 def index():
     """API Info"""
     return jsonify({
         "name": "HunyuanVideo API",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "features": {
             "hunyuan_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE) via Hugging Face HunyuanVideo",
+            "nava_generation": f"NAVA text-to-video via {NAVA_SPACE_ID} ({'✅ enabled' if NAVA_ENABLED else '❌ disabled'})",
             "audio_narration": "ElevenLabs (głos Adam)",
             "subtitles": "Whisper API (automatyczna transkrypcja)",
             "watermark": "raport-finansowy24.pl (dolny róg)",
@@ -1946,7 +2171,8 @@ def index():
             "checkpoint_resume": "Pause/resume – wznowienie od ostatniego etapu"
         },
         "endpoints": {
-            "POST /render-sequence": "Uruchomienie renderowania",
+            "POST /render-sequence": "Uruchomienie renderowania (HunyuanVideo)",
+            "POST /nava-generate": "Generowanie wideo NAVA (text-to-video)",
             "GET /tasks/<job_id>": "Status renderowania",
             "POST /resume/<job_id>": "Wznowienie wstrzymanego zadania od checkpointu",
             "GET /videos/<filename>": "Pobieranie wideo",
