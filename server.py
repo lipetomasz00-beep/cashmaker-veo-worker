@@ -659,15 +659,17 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     def _call_api():
         try:
             from gradio_client import Client
+            from huggingface_hub import login
             import os
 
             hf_token = os.getenv("HF_TOKEN")
 
-            # Create client with hf_token parameter (correct API for gradio_client >= 0.15.0)
-            client = Client(
-                "https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/",
-                hf_token=hf_token
-            )
+            # Authenticate globally with huggingface_hub
+            if hf_token:
+                login(token=hf_token)
+
+            # Create client without hf_token parameter
+            client = Client("https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/")
 
             result = client.predict(
                 prompt=prompt,
