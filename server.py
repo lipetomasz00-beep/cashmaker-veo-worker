@@ -665,16 +665,20 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     def _call_api():
         try:
             from gradio_client import Client
+            from huggingface_hub import login
             import os
 
             hf_token = os.getenv("HF_TOKEN")
             if not hf_token:
                 raise ValueError("HF_TOKEN environment variable is not set")
 
-            # Create client with hf_token parameter
+            # Authenticate via huggingface_hub before creating the Client
+            # (gradio_client no longer accepts hf_token in the constructor)
+            login(token=hf_token)
+
+            # Create client without auth parameter — login() above handles it
             client = Client(
-                "https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/",
-                hf_token=hf_token
+                "https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/"
             )
 
             # Call /handler endpoint with 13 parameters
