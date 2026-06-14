@@ -49,7 +49,7 @@ SKIP_NARRATION = os.getenv("SKIP_NARRATION", "false").lower() == "true"
 VEO_DURATION_SECONDS = int(os.getenv("VEO_DURATION_SECONDS", "6"))  # Per-scene GPU duration (6s × 3 scenes = 18s total)
 
 # Auto-retry configuration for paused jobs
-AUTO_RETRY_ENABLED = os.getenv("AUTO_RETRY_ENABLED", "true").lower() == "true"
+AUTO_RETRY_ENABLED = os.getenv("AUTO_RETRY_ENABLED", "false").lower() == "true"
 AUTO_RETRY_MAX_ATTEMPTS = int(os.getenv("AUTO_RETRY_MAX_ATTEMPTS", "3"))
 AUTO_RETRY_INITIAL_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_INITIAL_DELAY_SECONDS", "30"))
 AUTO_RETRY_MAX_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_MAX_DELAY_SECONDS", "600"))  # 10 minutes
