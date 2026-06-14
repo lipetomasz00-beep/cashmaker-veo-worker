@@ -703,12 +703,18 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     result = retry_with_backoff("LTX 2.3 Gradio", _call_api, max_retries=3, base_delay=30)
 
     # Extract video path from result
-    if isinstance(result, (list, tuple)) and result:
-        video_path = result[0]
-    elif isinstance(result, str):
-        video_path = result
+    # result is a tuple of 3 elements, element [1] contains {"video": "path/to/video.mp4"}
+    if isinstance(result, (list, tuple)) and len(result) > 1:
+        video_data = result[1]
+        if isinstance(video_data, dict):
+            video_path = video_data.get("video")
+        else:
+            video_path = video_data
     else:
         raise RuntimeError(f"Unexpected result format from LTX 2.3: {result}")
+
+    if not video_path:
+        raise RuntimeError("No video path found in LTX 2.3 response")
 
     # Download video from Gradio temp URL to output_path
     if video_path.startswith("http"):
