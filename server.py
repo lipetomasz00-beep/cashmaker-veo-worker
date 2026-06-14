@@ -652,19 +652,19 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     """Generate a video segment via LTX 2.3 Gradio Space and save it directly to output_path."""
 
     logger.info(f"🎬 LTX 2.3 (Gradio Space): generating video for prompt: {prompt[:60]}...")
-    logger.info("⏳ Calling LTX 2.3 Gradio Space...")
+    logger.info("⏳ Calling LTX 2.3 Gradio Space /generate_video endpoint...")
 
-    # Parse aspect ratio to width/height
-    if aspect_ratio == "9:16":
-        width, height = 512, 768
-    elif aspect_ratio == "16:9":
-        width, height = 768, 512
-    else:
-        width, height = 512, 768
+    def _make_blank_image_file():
+        """Create a small blank PNG in a temp file and return its path."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        img = Image.new("RGB", (64, 64), color=(0, 0, 0))
+        img.save(tmp.name, format="PNG")
+        tmp.close()
+        return tmp.name
 
     def _call_api():
         try:
-            from gradio_client import Client
+            from gradio_client import Client, handle_file
             from huggingface_hub import login
             import os
 
@@ -681,23 +681,53 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
                 "https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/"
             )
 
-            # Call /predict endpoint with 13 parameters
-            result = client.predict(
-                param_0=prompt,                    # Main prompt (text)
-                param_1="Balanced",                # Quality preset: 'Fast', 'Balanced', 'Quality'
-                param_2=width,                     # Width (e.g., 512)
-                param_3=height,                    # Height (e.g., 768)
-                param_4=5,                         # Duration in seconds
-                param_5=24,                        # FPS (frames per second)
-                param_6=42,                        # Seed
-                param_7=True,                      # Random seed each run
-                param_8="blurry, low quality",     # Negative prompt
-                param_9="none",                    # Camera motion: 'none', 'static', 'dolly-in'
-                param_10=0.8,                      # Camera motion strength
-                param_11=False,                    # Enable IC-LoRA-Detailer
-                param_12=0.5,                      # Detailer strength
-                api_name="/predict"
-            )
+            # Create placeholder blank images for the image parameters
+            # (this is text-to-video; the Space still requires FileData objects)
+            blank_image_path = _make_blank_image_file()
+            try:
+                # Call /generate_video endpoint with all 16 required parameters:
+                # [0]  Input Image (File)
+                # [1]  Last Image Optional (File)
+                # [2]  Prompt (string)
+                # [3]  Inference Steps (number)
+                # [4]  Negative Prompt (string)
+                # [5]  Duration in seconds (number)
+                # [6]  Guidance Scale - high noise (number)
+                # [7]  Guidance Scale 2 - low noise (number)
+                # [8]  Seed (number)
+                # [9]  Randomize seed (boolean)
+                # [10] Video Quality (number)
+                # [11] Scheduler (string)
+                # [12] Flow Shift (number)
+                # [13] Video Fluidity/FPS (string)
+                # [14] Safe Mode (boolean)
+                # [15] Display result (boolean)
+                result = client.predict(
+                    handle_file(blank_image_path),   # [0] Input Image
+                    handle_file(blank_image_path),   # [1] Last Image Optional
+                    prompt,                          # [2] Prompt
+                    6,                               # [3] Inference Steps
+                    "blurry, low quality, distorted, watermark",  # [4] Negative Prompt
+                    5,                               # [5] Duration in seconds
+                    3.5,                             # [6] Guidance Scale - high noise
+                    1,                               # [7] Guidance Scale 2 - low noise
+                    42,                              # [8] Seed
+                    True,                            # [9] Randomize seed
+                    6,                               # [10] Video Quality
+                    "UniPCMultistep",                # [11] Scheduler
+                    3,                               # [12] Flow Shift
+                    "16",                            # [13] Video Fluidity/FPS
+                    True,                            # [14] Safe Mode
+                    True,                            # [15] Display result
+                    api_name="/generate_video"
+                )
+            finally:
+                # Clean up the temporary blank image
+                try:
+                    os.unlink(blank_image_path)
+                except OSError:
+                    pass
+
             return result
         except Exception as e:
             if "overloaded" in str(e).lower() or "busy" in str(e).lower() or "503" in str(e):
@@ -706,19 +736,26 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
 
     result = retry_with_backoff("LTX 2.3 Gradio", _call_api, max_retries=3, base_delay=30)
 
-    # Extract video path from result
-    # result is a tuple of 3 elements, element [1] contains {"video": "path/to/video.mp4"}
-    if isinstance(result, (list, tuple)) and len(result) > 1:
-        video_data = result[1]
-        if isinstance(video_data, dict):
-            video_path = video_data.get("video")
-        else:
-            video_path = video_data
-    else:
-        raise RuntimeError(f"Unexpected result format from LTX 2.3: {result}")
+    # The /generate_video endpoint returns 3 elements:
+    #   [0] Generated Video (displayed in UI)
+    #   [1] Download Video File (the actual downloadable file path/URL)
+    #   [2] Seed (number used for generation)
+    # We prefer [1] (download file) and fall back to [0] (display video).
+    video_path = None
+    if isinstance(result, (list, tuple)) and len(result) >= 1:
+        # Try [1] first (download file), then [0] (display video)
+        for idx in (1, 0):
+            if idx < len(result):
+                candidate = result[idx]
+                if isinstance(candidate, dict):
+                    video_path = candidate.get("video") or candidate.get("path") or candidate.get("url")
+                elif isinstance(candidate, str) and candidate:
+                    video_path = candidate
+                if video_path:
+                    break
 
     if not video_path:
-        raise RuntimeError("No video path found in LTX 2.3 response")
+        raise RuntimeError(f"No video path found in LTX 2.3 /generate_video response: {result}")
 
     # Download video from Gradio temp URL to output_path
     if video_path.startswith("http"):
@@ -729,7 +766,7 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
             f.write(response.content)
         logger.info(f"✅ Video saved to {output_path}")
     else:
-        # Local file path
+        # Local file path returned by Gradio
         import shutil
         shutil.copy(video_path, output_path)
         logger.info(f"✅ Video copied to {output_path}")
