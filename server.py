@@ -1882,17 +1882,17 @@ except Exception as val_err:
     logger.error(f"⚠️ Uwaga: Błąd walidacji, ale startujemy dalej: {val_err}")
     # sys.exit(1)  # <--- COMMENTED OUT
 
-if __name__ == "__main__":
-    logger.info("🚀 Startup HunyuanVideo API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
-    logger.info(f"📁 Storage: {STORAGE_DIR}")
-    logger.info(f"🗄️  Database: {DB_PATH}")
-    logger.info(f"🎙️ ElevenLabs: {'✅' if ELEVENLABS_API_KEY else '❌'}")
+# ---------------------------------------------------------------------------
+# STARTUP INITIALIZATION (runs on import by Gunicorn or direct execution)
+# ---------------------------------------------------------------------------
+logger.info("🚀 Startup HunyuanVideo API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
+logger.info(f"📁 Storage: {STORAGE_DIR}")
+logger.info(f"🗄️  Database: {DB_PATH}")
+logger.info(f"🎙️ ElevenLabs: {'✅' if ELEVENLABS_API_KEY else '❌'}")
 
-    cleanup_old_files(hours=24)
+cleanup_old_files(hours=24)
 
-    # Start auto-retry worker thread
-    retry_thread = threading.Thread(target=auto_retry_worker, daemon=True)
-    retry_thread.start()
-    logger.info("✅ Auto-retry worker started")
-
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+# Start auto-retry worker thread
+retry_thread = threading.Thread(target=auto_retry_worker, daemon=True)
+retry_thread.start()
+logger.info("✅ Auto-retry worker started")
