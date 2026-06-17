@@ -45,9 +45,15 @@ ENABLE_DRY_RUN = os.getenv("ENABLE_DRY_RUN", "false").lower() == "true"
 FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "8"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("IDEMPOTENCY_TTL_SECONDS", "3600"))
+SKIP_NARRATION = os.getenv("SKIP_NARRATION", "false").lower() == "true"
+VEO_DURATION_SECONDS = int(os.getenv("VEO_DURATION_SECONDS", "6"))  # Per-scene GPU duration (6s × 3 scenes = 18s total)
+
+# NAVA text-to-video configuration
+NAVA_ENABLED = os.getenv("NAVA_ENABLED", "false").lower() == "true"
+NAVA_SPACE_ID = os.getenv("NAVA_SPACE_ID", "prithivMLmods/NAVA-Text-to-Video")
 
 # Auto-retry configuration for paused jobs
-AUTO_RETRY_ENABLED = os.getenv("AUTO_RETRY_ENABLED", "true").lower() == "true"
+AUTO_RETRY_ENABLED = os.getenv("AUTO_RETRY_ENABLED", "false").lower() == "true"
 AUTO_RETRY_MAX_ATTEMPTS = int(os.getenv("AUTO_RETRY_MAX_ATTEMPTS", "3"))
 AUTO_RETRY_INITIAL_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_INITIAL_DELAY_SECONDS", "30"))
 AUTO_RETRY_MAX_DELAY_SECONDS = int(os.getenv("AUTO_RETRY_MAX_DELAY_SECONDS", "600"))  # 10 minutes
@@ -177,7 +183,10 @@ def validate_required_env():
         raise RuntimeError("System dependency 'ffprobe' is missing from PATH. Install it first.")
 
     # 2. Walidacja obecności wymaganych zmiennych
-    required = ["HF_TOKEN", "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "WORKER_API_KEY"]
+    # ELEVENLABS_API_KEY is optional when SKIP_NARRATION=true
+    required = ["HF_TOKEN", "OPENAI_API_KEY", "WORKER_API_KEY"]
+    if not SKIP_NARRATION:
+        required.append("ELEVENLABS_API_KEY")
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         raise RuntimeError(
@@ -197,13 +206,16 @@ def validate_required_env():
         except Exception as e:
             raise RuntimeError(f"HF_TOKEN validation failed: {e}")
 
-        # Walidacja ElevenLabs
-        try:
-            el_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-            el_client.voices.get_all()
-            logger.info("✅ Klucz ELEVENLABS_API_KEY zweryfikowany pomyślnie.")
-        except Exception as e:
-            raise RuntimeError(f"ELEVENLABS_API_KEY validation failed: {e}")
+        # Walidacja ElevenLabs (pomijamy gdy SKIP_NARRATION=true)
+        if not SKIP_NARRATION:
+            try:
+                el_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+                el_client.voices.get_all()
+                logger.info("✅ Klucz ELEVENLABS_API_KEY zweryfikowany pomyślnie.")
+            except Exception as e:
+                raise RuntimeError(f"ELEVENLABS_API_KEY validation failed: {e}")
+        else:
+            logger.info("⏭️  SKIP_NARRATION=true – pomijam walidację ELEVENLABS_API_KEY.")
 
         # Walidacja OpenAI
         try:
@@ -427,7 +439,7 @@ def apply_optimization_rules(raw_data, topic):
     if vtr and vtr < 0.20:
         narration["problem"] = "Najczęstszy błąd rynkowy to wybór oferty bez dokładnej weryfikacji parametrów."
         narration["rozwiązanie"] = "Dostęp do rzetelnych danych pozwala podjąć decyzję w oparciu o czyste liczby, a nie obietnice."
-        raw_data["targetDuration"] = 12
+        raw_data["targetDuration"] = 18
         optimizations.append("low_vtr_shorter_story")
 
     if narration:
@@ -649,12 +661,18 @@ def get_render_from_db(job_id):
 # ---------------------------------------------------------------------------
 
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
-    """Generate a video segment via HunyuanVideo Gradio Space
-    and save it directly to output_path."""
+    """Generate a video segment via LTX 2.3 Gradio Space and save it directly to output_path."""
 
-    logger.info(f"🎬 HunyuanVideo (Gradio Space): generating video for prompt: {prompt[:60]}...")
+    logger.info(f"🎬 LTX 2.3 (Gradio Space): generating video for prompt: {prompt[:60]}...")
+    logger.info("⏳ Calling LTX 2.3 Gradio Space /generate_video endpoint...")
 
-    logger.info("⏳ Calling HunyuanVideo Gradio Space...")
+    def _make_blank_image_file():
+        """Create a small blank PNG in a temp file and return its path."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        img = Image.new("RGB", (64, 64), color=(0, 0, 0))
+        img.save(tmp.name, format="PNG")
+        tmp.close()
+        return tmp.name
 
     def _call_api():
         try:
@@ -663,6 +681,12 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
             import os
 
             hf_token = os.getenv("HF_TOKEN")
+            if not hf_token:
+                raise ValueError("HF_TOKEN environment variable is not set")
+
+            # Authenticate via huggingface_hub before creating the Client
+            # (gradio_client no longer accepts hf_token in the constructor)
+            login(token=hf_token)
 
             # Authenticate globally with huggingface_hub
             if hf_token:
@@ -671,31 +695,96 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
             # Create client without hf_token parameter
             client = Client("https://r3gm-wan2-2-fp8da-aoti-preview-2.hf.space/")
 
-            result = client.predict(
-                prompt=prompt,
-                api_name="/generate_video"
-            )
+            # Create placeholder blank images for the image parameters
+            # (this is text-to-video; the Space still requires FileData objects)
+            blank_image_path = _make_blank_image_file()
+            try:
+                # Call /generate_video endpoint with all 16 required parameters:
+                # [0]  Input Image (File)
+                # [1]  Last Image Optional (File)
+                # [2]  Prompt (string)
+                # [3]  Inference Steps (number)
+                # [4]  Negative Prompt (string)
+                # [5]  Duration in seconds (number)
+                # [6]  Guidance Scale - high noise (number)
+                # [7]  Guidance Scale 2 - low noise (number)
+                # [8]  Seed (number)
+                # [9]  Randomize seed (boolean)
+                # [10] Video Quality (number)
+                # [11] Scheduler (string)
+                # [12] Flow Shift (number)
+                # [13] Video Fluidity/FPS (number)
+                # [14] Safe Mode (boolean)
+                # [15] Display result (boolean)
+                result = client.predict(
+                    handle_file(blank_image_path),   # [0] Input Image
+                    handle_file(blank_image_path),   # [1] Last Image Optional
+                    prompt,                          # [2] Prompt
+                    6,                               # [3] Inference Steps
+                    "blurry, low quality, distorted, watermark",  # [4] Negative Prompt
+                    VEO_DURATION_SECONDS,            # [5] Duration in seconds
+                    3.5,                             # [6] Guidance Scale - high noise
+                    1,                               # [7] Guidance Scale 2 - low noise
+                    42,                              # [8] Seed
+                    True,                            # [9] Randomize seed
+                    6,                               # [10] Video Quality
+                    "UniPCMultistep",                # [11] Scheduler
+                    3,                               # [12] Flow Shift
+                    16,                              # [13] Video Fluidity/FPS
+                    True,                            # [14] Safe Mode
+                    True,                            # [15] Display result
+                    api_name="/generate_video"
+                )
+            finally:
+                # Clean up the temporary blank image
+                try:
+                    os.unlink(blank_image_path)
+                except OSError:
+                    pass
+
             return result
         except Exception as e:
             if "overloaded" in str(e).lower() or "busy" in str(e).lower() or "503" in str(e):
                 raise RuntimeError("Space overloaded – retry")
             raise
 
-    result = retry_with_backoff("HunyuanVideo Gradio", _call_api, max_retries=3, base_delay=30)
+    result = retry_with_backoff("LTX 2.3 Gradio", _call_api, max_retries=3, base_delay=30)
 
-    # Extract video path from result
-    if isinstance(result, (list, tuple)) and result:
-        video_path = result[0]
-    elif isinstance(result, str):
-        video_path = result
+    # The /generate_video endpoint returns 3 elements:
+    #   [0] Generated Video (displayed in UI)
+    #   [1] Download Video File (the actual downloadable file path/URL)
+    #   [2] Seed (number used for generation)
+    # We prefer [1] (download file) and fall back to [0] (display video).
+    video_path = None
+    if isinstance(result, (list, tuple)) and len(result) >= 1:
+        # Try [1] first (download file), then [0] (display video)
+        for idx in (1, 0):
+            if idx < len(result):
+                candidate = result[idx]
+                if isinstance(candidate, dict):
+                    video_path = candidate.get("video") or candidate.get("path") or candidate.get("url")
+                elif isinstance(candidate, str) and candidate:
+                    video_path = candidate
+                if video_path:
+                    break
+
+    if not video_path:
+        raise RuntimeError(f"No video path found in LTX 2.3 /generate_video response: {result}")
+
+    # Download video from Gradio temp URL to output_path
+    if video_path.startswith("http"):
+        logger.info(f"📥 Downloading video from {video_path[:80]}...")
+        response = requests.get(video_path, timeout=300)
+        response.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+        logger.info(f"✅ Video saved to {output_path}")
     else:
-        raise RuntimeError(f"Unexpected Gradio output format: {result}")
+        # Local file path returned by Gradio
+        import shutil
+        shutil.copy(video_path, output_path)
+        logger.info(f"✅ Video copied to {output_path}")
 
-    # Copy video to output_path
-    import shutil
-    shutil.copy(str(video_path), output_path)
-
-    logger.info(f"✅ Video saved to {output_path}")
     return output_path
 
 
@@ -721,6 +810,134 @@ def _get_bucket_client():
         aws_secret_access_key=os.getenv("BUCKET_SECRET_ACCESS_KEY"),
         region_name=os.getenv("BUCKET_REGION", "auto"),
     )
+
+
+def _upload_video_to_s3(local_path, object_key):
+    """Upload a local video file to the S3 bucket and return its public URL.
+
+    Returns the public URL string on success, or raises on failure.
+    """
+    bucket_name = os.getenv("BUCKET_NAME")
+    if not bucket_name:
+        raise ValueError("BUCKET_NAME environment variable is not set")
+
+    s3 = _get_bucket_client()
+    s3.upload_file(
+        local_path,
+        bucket_name,
+        object_key,
+        ExtraArgs={"ContentType": "video/mp4"},
+    )
+
+    endpoint = os.getenv("BUCKET_ENDPOINT_URL", "").rstrip("/")
+    if endpoint:
+        public_url = f"{endpoint}/{bucket_name}/{object_key}"
+    else:
+        region = os.getenv("BUCKET_REGION", "us-east-1")
+        public_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{object_key}"
+
+    logger.info(f"☁️  Uploaded {object_key} → {public_url}")
+    return public_url
+
+
+def generate_nava_video(
+    prompt,
+    duration_sec=6.0,
+    aspect_ratio="1:1 (960×960)",
+    steps=20.0,
+):
+    """Generate a video using the NAVA Gradio Space and upload it to S3.
+
+    Parameters
+    ----------
+    prompt : str
+        Text description of the video to generate.
+    duration_sec : float
+        Duration of the generated video in seconds (4–6 s accepted by NAVA).
+    aspect_ratio : str
+        Aspect ratio string as expected by the NAVA Space UI
+        (e.g. "1:1 (960×960)", "16:9 (848×480)", "9:16 (480×848)").
+    steps : float
+        Number of inference steps (default 20).
+
+    Returns
+    -------
+    str
+        Public URL of the uploaded video.
+    """
+    if not NAVA_ENABLED:
+        raise RuntimeError(
+            "NAVA is disabled. Set NAVA_ENABLED=true to enable this feature."
+        )
+
+    logger.info(
+        f"🎬 NAVA: generating video | prompt={prompt[:60]!r} "
+        f"duration={duration_sec}s aspect={aspect_ratio} steps={steps}"
+    )
+
+    def _call_nava_api():
+        from gradio_client import Client
+        from huggingface_hub import login
+
+        hf_token = os.getenv("HF_TOKEN")
+        if not hf_token:
+            raise ValueError("HF_TOKEN environment variable is not set")
+
+        login(token=hf_token)
+
+        client = Client(f"https://huggingface.co/spaces/{NAVA_SPACE_ID}")
+
+        result = client.predict(
+            prompt,          # Prompt (str)
+            duration_sec,    # Duration in seconds (float)
+            aspect_ratio,    # Aspect ratio (str)
+            steps,           # Inference steps (float)
+            api_name="/generate",
+        )
+        return result
+
+    result = retry_with_backoff("NAVA Gradio", _call_nava_api, max_retries=3, base_delay=30)
+
+    # The NAVA Space returns the video file path/URL directly.
+    video_path = None
+    if isinstance(result, dict):
+        video_path = result.get("video") or result.get("path") or result.get("url")
+    elif isinstance(result, (list, tuple)) and len(result) >= 1:
+        candidate = result[0]
+        if isinstance(candidate, dict):
+            video_path = candidate.get("video") or candidate.get("path") or candidate.get("url")
+        elif isinstance(candidate, str) and candidate:
+            video_path = candidate
+    elif isinstance(result, str) and result:
+        video_path = result
+
+    if not video_path:
+        raise RuntimeError(f"No video path found in NAVA /generate response: {result}")
+
+    # Download or copy the video to a local temp file
+    local_tmp = os.path.join(tempfile.gettempdir(), f"nava_{uuid.uuid4().hex}.mp4")
+    if video_path.startswith("http"):
+        logger.info(f"📥 Downloading NAVA video from {video_path[:80]}...")
+        resp = requests.get(video_path, timeout=300)
+        resp.raise_for_status()
+        with open(local_tmp, "wb") as fh:
+            fh.write(resp.content)
+    else:
+        shutil.copy(video_path, local_tmp)
+
+    logger.info(f"✅ NAVA video saved locally: {local_tmp}")
+
+    # Upload to S3 and return the public URL
+    object_key = f"nava/{uuid.uuid4().hex}.mp4"
+    try:
+        public_url = _upload_video_to_s3(local_tmp, object_key)
+    finally:
+        try:
+            os.unlink(local_tmp)
+        except OSError:
+            pass
+
+    return public_url
 
 
 # ---------------------------------------------------------------------------
@@ -800,6 +1017,52 @@ def generate_audio_narration(narration_texts, job_id):
             raise 
 
     return audio_files
+
+
+def generate_silent_audio_narration(narration_texts, job_id, duration_per_scene=6.0):
+    """Create silent MP3 placeholder files instead of calling ElevenLabs.
+
+    Used when SKIP_NARRATION=true so the rest of the pipeline (assembly,
+    speed-adjustment, FFmpeg concat) can proceed without audio.  Each scene
+    gets a silent MP3 of `duration_per_scene` seconds so that
+    calculate_video_speed() has valid durations to work with.
+    """
+    audio_files = {}
+    for scene_key in narration_texts.keys():
+        audio_file = os.path.join(tempfile.gettempdir(), f"narration_{scene_key}_{job_id}.mp3")
+
+        if os.path.exists(audio_file):
+            logger.info(f"⏩ Cicha ścieżka {scene_key} już istnieje – pomijam.")
+            duration = get_audio_duration(audio_file)
+            audio_files[scene_key] = {"path": audio_file, "duration": duration, "text": narration_texts[scene_key]}
+            continue
+
+        logger.info(f"🔇 Tworzę cichą ścieżkę zastępczą: {scene_key} ({duration_per_scene}s)")
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=mono",
+            "-t", str(duration_per_scene),
+            "-c:a", "libmp3lame", "-q:a", "9",
+            audio_file,
+        ]
+        try:
+            subprocess.run(
+                ffmpeg_cmd, check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30
+            )
+            logger.info(f"✅ Cicha ścieżka {scene_key} zapisana: {audio_file}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.error(f"❌ Nie udało się utworzyć cichej ścieżki {scene_key}: {e}")
+            raise RuntimeError(f"Failed to create silent audio placeholder for {scene_key}: {e}") from e
+
+        audio_files[scene_key] = {
+            "path": audio_file,
+            "duration": duration_per_scene,
+            "text": narration_texts[scene_key],
+        }
+
+    return audio_files
+
 
 # ---------------------------------------------------------------------------
 # NAPISY: GENEROWANIE SRT Z AUDIO (Whisper API)
@@ -1000,7 +1263,7 @@ def get_video_duration(video_file):
 # AUTOMATYCZNE DOPASOWANIE DŁUGOŚCI
 # ---------------------------------------------------------------------------
 
-def calculate_video_speed(audio_files, target_duration=15):
+def calculate_video_speed(audio_files, target_duration=18):
     """Obliczenie prędkości playbacku aby zmieścić się w target_duration"""
     total_audio_duration = sum(audio["duration"] for audio in audio_files.values())
     total_audio_duration += 2  # Buffer dla CTA
@@ -1081,68 +1344,94 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
     logger.info(f"✅ Wideo połączone: {concat_output}")
     
     logger.info("🎙️ Etap 2: Miksowanie audio (lektory)...")
-    
+
     combined_audio = os.path.join(tempfile.gettempdir(), f"combined_audio_{job_id}.mp3")
-    
     audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_{job_id}.txt")
-    with open(audio_list_file, "w") as f:
-        for scene_key in ["hook", "problem", "rozwiązanie"]:
-            if scene_key in audio_files:
-                f.write(f"file '{audio_files[scene_key]['path']}'\n")
-    
-    ffmpeg_audio_concat = [
-        'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
-        '-c:a', 'libmp3lame', '-q:a', '4',
-        combined_audio
+
+    # Collect audio entries that actually exist on disk
+    audio_entries = [
+        audio_files[k]["path"]
+        for k in ["hook", "problem", "rozwiązanie"]
+        if k in audio_files and os.path.exists(audio_files[k]["path"])
     ]
-    subprocess.run(ffmpeg_audio_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-    logger.info(f"✅ Lektory połączone: {combined_audio}")
-    
+    has_audio = bool(audio_entries)
+
+    if has_audio:
+        with open(audio_list_file, "w") as f:
+            for path in audio_entries:
+                f.write(f"file '{path}'\n")
+
+        ffmpeg_audio_concat = [
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
+            '-c:a', 'libmp3lame', '-q:a', '4',
+            combined_audio
+        ]
+        subprocess.run(ffmpeg_audio_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        logger.info(f"✅ Lektory połączone: {combined_audio}")
+    else:
+        logger.info("⏭️  Brak ścieżek audio – montaż wideo bez dźwięku.")
+
     logger.info("🎨 Etap 3: Miksowanie wideo + audio + napisy...")
-    
+
     # BŁĄD LOGICZNY USUNIĘTY: Skoro speed robimy w innej funkcji, tu dajemy zwykłe kopiowanie strumienia video (bez setpts)
     # Zostawiamy po prostu wejście wideo bez modyfikacji czasu, żeby nie podwoić przyspieszenia.
     video_filter = "[0:v]copy" if srt_file is None else "[0:v]format=yuv420p"
-    
+
     # Budujemy łańcuch filtrów
     filters = []
-    
+
     if srt_file and os.path.exists(srt_file):
         srt_path_escaped = srt_file.replace("\\", "\\\\").replace(":", "\\:")
         # Eleganckie, wyraźne napisy dopasowane do profesjonalnego brandingu
         filters.append(f"subtitles='{srt_path_escaped}':force_style='FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2,Shadow=0'")
         logger.info(f"✅ Napisy będą wypalane")
-    
+
     watermark_text = "raport-finansowy24.pl"
     filters.append(f"drawtext=text='{watermark_text}':x=w-text_w-20:y=h-text_h-20:fontsize=24:fontcolor=white@0.7:box=1:boxcolor=black@0.5")
-    
+
     # Łączymy filtry wideo przecinkami
     final_video_filter = ",".join(filters)
-    
-    ffmpeg_final_cmd = [
-        'ffmpeg', '-y',
-        '-i', concat_output,
-        '-i', combined_audio,
-        '-filter_complex',
-        f"[0:v]{final_video_filter}[vout];[1:a]volume=1.0[aout]",
-        '-map', '[vout]', '-map', '[aout]',
-        # STABILNOŚĆ: ultrafast i threads=2 zapobiegną zabiciu procesu przez Gunicorn
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
-        '-c:a', 'aac', '-b:a', '128k',
-        output_path
-    ]
-    
+
+    if has_audio:
+        ffmpeg_final_cmd = [
+            'ffmpeg', '-y',
+            '-i', concat_output,
+            '-i', combined_audio,
+            '-filter_complex',
+            f"[0:v]{final_video_filter}[vout];[1:a]volume=1.0[aout]",
+            '-map', '[vout]', '-map', '[aout]',
+            # STABILNOŚĆ: ultrafast i threads=2 zapobiegną zabiciu procesu przez Gunicorn
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            output_path
+        ]
+    else:
+        # No audio track – video-only output (SKIP_NARRATION mode)
+        ffmpeg_final_cmd = [
+            'ffmpeg', '-y',
+            '-i', concat_output,
+            '-filter_complex',
+            f"[0:v]{final_video_filter}[vout]",
+            '-map', '[vout]',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
+            '-an',
+            output_path
+        ]
+
     logger.info("🔄 Kodowanie finale (może potrwać trochę)...")
     subprocess.run(ffmpeg_final_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
     logger.info(f"✅ Finalne wideo: {output_path}")
-    
-    for file in [list_file_path, audio_list_file, concat_output, combined_audio]:
+
+    cleanup_files = [list_file_path, concat_output]
+    if has_audio:
+        cleanup_files += [audio_list_file, combined_audio]
+    for file in cleanup_files:
         if os.path.exists(file):
             try:
                 os.remove(file)
             except Exception as e:
                 logger.warning(f"⚠️ Nie udało się usunąć {file}: {e}")
-    
+
     return output_path
 
 # ---------------------------------------------------------------------------
@@ -1267,55 +1556,65 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         if not _stage_done("narration"):
             current_stage = "narration"
             save_checkpoint(job_id, current_stage, data={"topic": topic})
-            logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
+            if SKIP_NARRATION:
+                logger.info("⏭️  SKIP_NARRATION=true – pomijam ElevenLabs, tworzę ciche ścieżki zastępcze.")
+            else:
+                logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
 
         narration_texts = custom_narration if custom_narration else NARRATION_TEMPLATES
-        audio_files_dict = generate_audio_narration(narration_texts, job_id)
-        logger.info(f"✅ Lektor wygenerowany")
+        if SKIP_NARRATION:
+            audio_files_dict = generate_silent_audio_narration(narration_texts, job_id)
+            logger.info("✅ Ciche ścieżki zastępcze gotowe (SKIP_NARRATION=true)")
+        else:
+            audio_files_dict = generate_audio_narration(narration_texts, job_id)
+            logger.info(f"✅ Lektor wygenerowany")
 
         check_job_timeout()
         srt_file = None
-        
-        # Generowanie napisów
-        combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
-        audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_trans_{job_id}.txt")
 
-        try:
-            with open(audio_list_file, "w") as f:
-                for scene_key in ["hook", "problem", "rozwiązanie"]:
-                    if scene_key in audio_files_dict:
-                        f.write(f"file '{audio_files_dict[scene_key]['path']}'\n")
+        # Generowanie napisów (pomijamy gdy SKIP_NARRATION=true – brak realnego audio do transkrypcji)
+        if SKIP_NARRATION:
+            logger.info("⏭️  SKIP_NARRATION=true – pomijam generowanie napisów (Whisper).")
+        else:
+            combined_for_transcription = os.path.join(tempfile.gettempdir(), f"combined_trans_{job_id}.mp3")
+            audio_list_file = os.path.join(tempfile.gettempdir(), f"audio_list_trans_{job_id}.txt")
 
-            ffmpeg_concat = [
-                'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
-                '-c:a', 'libmp3lame', '-q:a', '4',
-                combined_for_transcription
-            ]
-            
-            # ZABEZPIECZENIE: Try-except dla łączenia audio
             try:
-                subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-                srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
-            except subprocess.CalledProcessError as e:
-                logger.error(f"❌ Błąd FFmpeg przy łączeniu audio dla Whispera: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'Brak'}")
-                srt_file = None
-            except subprocess.TimeoutExpired:
-                logger.error("❌ Błąd: Timeout FFmpeg przy łączeniu audio dla Whispera.")
-                srt_file = None
+                with open(audio_list_file, "w") as f:
+                    for scene_key in ["hook", "problem", "rozwiązanie"]:
+                        if scene_key in audio_files_dict:
+                            f.write(f"file '{audio_files_dict[scene_key]['path']}'\n")
 
-        except Exception as e:
-            logger.warning(f"⚠️ Napisy niedostępne: {e}")
-            srt_file = None
-        finally:
-            if os.path.exists(combined_for_transcription):
-                os.remove(combined_for_transcription)
-            if os.path.exists(audio_list_file):
-                os.remove(audio_list_file)
+                ffmpeg_concat = [
+                    'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', audio_list_file,
+                    '-c:a', 'libmp3lame', '-q:a', '4',
+                    combined_for_transcription
+                ]
+
+                # ZABEZPIECZENIE: Try-except dla łączenia audio
+                try:
+                    subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                    srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"❌ Błąd FFmpeg przy łączeniu audio dla Whispera: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'Brak'}")
+                    srt_file = None
+                except subprocess.TimeoutExpired:
+                    logger.error("❌ Błąd: Timeout FFmpeg przy łączeniu audio dla Whispera.")
+                    srt_file = None
+
+            except Exception as e:
+                logger.warning(f"⚠️ Napisy niedostępne: {e}")
+                srt_file = None
+            finally:
+                if os.path.exists(combined_for_transcription):
+                    os.remove(combined_for_transcription)
+                if os.path.exists(audio_list_file):
+                    os.remove(audio_list_file)
 
         check_job_timeout()
         logger.info("⏱️ Etap automatycznego dopasowania długości...")
 
-        target_duration = int(raw_data.get("targetDuration", 15))
+        target_duration = int(raw_data.get("targetDuration", 18))
         speed = calculate_video_speed(audio_files_dict, target_duration)
 
         if speed != 1.0:
@@ -1358,7 +1657,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         # ZABEZPIECZENIE: Łapanie błędu krytycznego podczas finałowego sklejania
         try:
             subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-            os.replace(final_with_endscreen, final_output_path)
+            shutil.move(final_with_endscreen, final_output_path)
             logger.info(f"✅ Plansza końcowa dodana")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.error(f"❌ Nie udało się dodać planszy końcowej. Zostawiam wideo bez niej. Błąd: {e}")
@@ -1765,14 +2064,107 @@ def metrics():
     return jsonify(METRICS), 200
 
 
+@app.route("/nava-generate", methods=["POST"])
+def nava_generate():
+    """POST /nava-generate
+
+    Generate a short video using the NAVA text-to-video model
+    (prithivMLmods/NAVA-Text-to-Video) and return a public S3 URL.
+
+    Request body (JSON):
+        prompt       (str,   required) – text description of the video
+        duration_sec (float, optional, default 6) – video length in seconds (4–6)
+        aspect_ratio (str,   optional, default "1:1 (960×960)") – output aspect ratio
+        steps        (float, optional, default 20) – number of inference steps
+        webhookUrl   (str,   optional) – URL to POST a completion notification to
+
+    Response 200:
+        { "video_url": "<public S3 URL>" }
+
+    Response 503:
+        { "error": "NAVA is disabled …" }
+    """
+    auth_error = require_api_key()
+    if auth_error:
+        return auth_error
+
+    if not NAVA_ENABLED:
+        return jsonify({
+            "error": "NAVA is disabled on this instance. Set NAVA_ENABLED=true to enable."
+        }), 503
+
+    data = request.json or {}
+
+    # Validate webhook URL if provided
+    webhook_url = data.get("webhookUrl")
+    if webhook_url and not is_valid_public_url(webhook_url):
+        return jsonify({"error": "Invalid or unsafe 'webhookUrl' (SSRF protection)"}), 400
+
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "Missing or empty 'prompt'"}), 400
+
+    try:
+        duration_sec = float(data.get("duration_sec", 6))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'duration_sec' must be a number"}), 400
+
+    if not (4 <= duration_sec <= 6):
+        return jsonify({"error": "'duration_sec' must be between 4 and 6"}), 400
+
+    aspect_ratio = str(data.get("aspect_ratio", "1:1 (960×960)"))
+
+    try:
+        steps = float(data.get("steps", 20))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'steps' must be a number"}), 400
+
+    logger.info(
+        f"📥 NAVA request | prompt={prompt[:60]!r} duration={duration_sec}s "
+        f"aspect={aspect_ratio} steps={steps}"
+    )
+
+    try:
+        video_url = generate_nava_video(
+            prompt=prompt,
+            duration_sec=duration_sec,
+            aspect_ratio=aspect_ratio,
+            steps=steps,
+        )
+    except RuntimeError as exc:
+        logger.error(f"❌ NAVA generation failed: {exc}")
+        return jsonify({"error": str(exc)}), 502
+    except Exception as exc:
+        logger.error(f"❌ NAVA unexpected error: {exc}", exc_info=True)
+        return jsonify({"error": "Internal server error during NAVA generation"}), 500
+
+    logger.info(f"✅ NAVA video ready: {video_url}")
+
+    if webhook_url:
+        try:
+            send_webhook(webhook_url, {
+                "event_type": "nava.completed",
+                "status": "success",
+                "video_url": video_url,
+                "prompt": prompt,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            logger.info("🔔 NAVA webhook sent")
+        except Exception as exc:
+            logger.warning(f"⚠️ NAVA webhook failed: {exc}")
+
+    return jsonify({"video_url": video_url}), 200
+
+
 @app.route("/", methods=["GET"])
 def index():
     """API Info"""
     return jsonify({
         "name": "HunyuanVideo API",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "features": {
             "hunyuan_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE) via Hugging Face HunyuanVideo",
+            "nava_generation": f"NAVA text-to-video via {NAVA_SPACE_ID} ({'✅ enabled' if NAVA_ENABLED else '❌ disabled'})",
             "audio_narration": "ElevenLabs (głos Adam)",
             "subtitles": "Whisper API (automatyczna transkrypcja)",
             "watermark": "raport-finansowy24.pl (dolny róg)",
@@ -1781,7 +2173,8 @@ def index():
             "checkpoint_resume": "Pause/resume – wznowienie od ostatniego etapu"
         },
         "endpoints": {
-            "POST /render-sequence": "Uruchomienie renderowania",
+            "POST /render-sequence": "Uruchomienie renderowania (HunyuanVideo)",
+            "POST /nava-generate": "Generowanie wideo NAVA (text-to-video)",
             "GET /tasks/<job_id>": "Status renderowania",
             "POST /resume/<job_id>": "Wznowienie wstrzymanego zadania od checkpointu",
             "GET /videos/<filename>": "Pobieranie wideo",
@@ -1807,17 +2200,17 @@ except Exception as val_err:
     logger.error(f"⚠️ Uwaga: Błąd walidacji, ale startujemy dalej: {val_err}")
     # sys.exit(1)  # <--- COMMENTED OUT
 
-if __name__ == "__main__":
-    logger.info("🚀 Startup HunyuanVideo API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
-    logger.info(f"📁 Storage: {STORAGE_DIR}")
-    logger.info(f"🗄️  Database: {DB_PATH}")
-    logger.info(f"🎙️ ElevenLabs: {'✅' if ELEVENLABS_API_KEY else '❌'}")
+# ---------------------------------------------------------------------------
+# STARTUP INITIALIZATION (runs on import by Gunicorn or direct execution)
+# ---------------------------------------------------------------------------
+logger.info("🚀 Startup HunyuanVideo API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
+logger.info(f"📁 Storage: {STORAGE_DIR}")
+logger.info(f"🗄️  Database: {DB_PATH}")
+logger.info(f"🎙️ ElevenLabs: {'✅' if ELEVENLABS_API_KEY else '❌'}")
 
-    cleanup_old_files(hours=24)
+cleanup_old_files(hours=24)
 
-    # Start auto-retry worker thread
-    retry_thread = threading.Thread(target=auto_retry_worker, daemon=True)
-    retry_thread.start()
-    logger.info("✅ Auto-retry worker started")
-
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+# Start auto-retry worker thread
+retry_thread = threading.Thread(target=auto_retry_worker, daemon=True)
+retry_thread.start()
+logger.info("✅ Auto-retry worker started")
