@@ -12,3 +12,7 @@ __pycache__/
 .venv/
 env/
 venv/
+__pycache__/
+node_modules/ venv/
+__pycache__/
+node_modules/

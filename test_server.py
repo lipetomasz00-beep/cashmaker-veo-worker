@@ -32,6 +32,7 @@ sys.modules['openai'] = mock_openai
 
 # Set testing environment variables before importing server
 os.environ["TESTING"] = "true"
+os.environ["STORAGE_DIR"] = "./data"
 os.environ["HF_TOKEN"] = "dummy_hf_token"
 os.environ["ELEVENLABS_API_KEY"] = "dummy_elevenlabs"
 os.environ["OPENAI_API_KEY"] = "dummy_openai"
