@@ -103,26 +103,6 @@ METRICS = {
     "webhook_failed": 0,
     "last_error": None
 }
-
-# ElevenLabs API
-ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
-if not ELEVENLABS_API_KEY:
-    logger.warning("⚠️ ELEVENLABS_API_KEY not set!")
-
-def is_valid_public_url(url):
-    """
-    Walidacja URL-a w celu ochrony przed SSRF.
-    Zezwala tylko na publiczne adresy HTTP/HTTPS.
-    """
-    if not url:
-        return False
-    try:
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False
-        host = parsed.hostname
-        if not host:
-            return False
         
         # Podczas testów automatycznych ignorujemy fizyczną rezolucję DNS (może nie być dostępna w piaskownicy)
         if IS_TESTING:
@@ -205,18 +185,7 @@ def validate_required_env():
             logger.info("✅ Klucz HF_TOKEN zweryfikowany pomyślnie.")
         except Exception as e:
             raise RuntimeError(f"HF_TOKEN validation failed: {e}")
-
-        # Walidacja ElevenLabs (pomijamy gdy SKIP_NARRATION=true)
-        if not SKIP_NARRATION:
-            try:
-                el_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-                el_client.voices.get_all()
-                logger.info("✅ Klucz ELEVENLABS_API_KEY zweryfikowany pomyślnie.")
-            except Exception as e:
-                raise RuntimeError(f"ELEVENLABS_API_KEY validation failed: {e}")
-        else:
-            logger.info("⏭️  SKIP_NARRATION=true – pomijam walidację ELEVENLABS_API_KEY.")
-
+            
         # Walidacja OpenAI
         try:
             from openai import OpenAI
@@ -492,22 +461,7 @@ def ensure_retry_columns():
 init_db()
 ensure_retry_columns()
 
-def generate_audio_with_elevenlabs(text, voice_id="pNInz6obpgDQGcFmaJgB"):
-    """Helper do generowania audio z ElevenLabs."""
-    client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-    response = client.text_to_speech.convert(
-        text=text,
-        voice_id=voice_id,
-        model_id="eleven_multilingual_v2"
-    )
-    audio_data = b""
-    for chunk in response:
-        if chunk:
-            audio_data += chunk
-    return audio_data
 
-def call_elevenlabs_with_cache(text, voice_id, cache_key_prefix, max_retries=2):
-    """Call ElevenLabs API with STABLE caching to minimize costs."""
     # Użycie MD5 zamiast losowego hash(), aby cache przetrwał restarty serwera
     text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()[:10]
     cache_key = f"elevenlabs:{cache_key_prefix}:{text_hash}"
