@@ -235,6 +235,15 @@ def validate_required_env():
     else:
         logger.info("🧪 DRY_RUN lub TESTING włączony - pomijam twardą walidację kluczy API.")
 
+
+    # Initialize HuggingFace Inference Client for Wan2.2
+    if not ENABLE_DRY_RUN and not IS_TESTING:
+        try:
+            init_hf_client()
+        except Exception as e:
+            logger.error(f"Failed to initialize HF_CLIENT: {e}")
+            raise
+
 def require_api_key():
     """Wymagaj poprawnego API key w nagłówku Authorization lub X-API-Key."""
     auth_header = request.headers.get("Authorization", "")
