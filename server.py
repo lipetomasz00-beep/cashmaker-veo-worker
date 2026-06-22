@@ -969,7 +969,7 @@ def generate_nava_video(
     prompt,
     duration_sec=6.0,
     aspect_ratio="1:1 (960×960)",
-    steps=20.0,
+    steps=4.0,  # TESTING: minimum quality
 ):
     """Generate a video using the NAVA Gradio Space and upload it to S3.
 
@@ -2188,7 +2188,7 @@ def nava_generate():
     aspect_ratio = str(data.get("aspect_ratio", "1:1 (960×960)"))
 
     try:
-        steps = float(data.get("steps", 20))
+        steps = float(data.get("steps", 4))  # TESTING: minimum quality
     except (TypeError, ValueError):
         return jsonify({"error": "'steps' must be a number"}), 400
 
