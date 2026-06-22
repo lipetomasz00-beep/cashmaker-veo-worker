@@ -17,7 +17,6 @@ import shutil
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_from_directory
 from PIL import Image, ImageDraw, ImageFont
-from elevenlabs.client import ElevenLabs
 
 # ---------------------------------------------------------------------------
 # KONFIGURACJA I INICJALIZACJA
@@ -103,7 +102,17 @@ METRICS = {
     "webhook_failed": 0,
     "last_error": None
 }
-        
+
+def is_valid_public_url(url):
+    """Sprawdź czy URL jest publiczny i bezpieczny (ochrona przed SSRF)."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+
         # Podczas testów automatycznych ignorujemy fizyczną rezolucję DNS (może nie być dostępna w piaskownicy)
         if IS_TESTING:
             if host in ("localhost", "127.0.0.1", "169.254.169.254"):
@@ -149,10 +158,10 @@ METRICS = {
         # Multicast/Broadcast/Unspecified
         if parts[0] >= 224:
             return False
-        
+
         return True
     except Exception:
-        return False 
+        return False
         
 def validate_required_env():
     """Walidacja wymaganych zmiennych środowiskowych, kluczy API i binariów systemowych."""
@@ -163,10 +172,7 @@ def validate_required_env():
         raise RuntimeError("System dependency 'ffprobe' is missing from PATH. Install it first.")
 
     # 2. Walidacja obecności wymaganych zmiennych
-    # ELEVENLABS_API_KEY is optional when SKIP_NARRATION=true
     required = ["HF_TOKEN", "OPENAI_API_KEY", "WORKER_API_KEY"]
-    if not SKIP_NARRATION:
-        required.append("ELEVENLABS_API_KEY")
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         raise RuntimeError(
@@ -461,32 +467,6 @@ def ensure_retry_columns():
 init_db()
 ensure_retry_columns()
 
-
-    # Użycie MD5 zamiast losowego hash(), aby cache przetrwał restarty serwera
-    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()[:10]
-    cache_key = f"elevenlabs:{cache_key_prefix}:{text_hash}"
-
-    # Check cache first
-    cached = get_cached_api_response(cache_key)
-    if cached:
-        return cached
-
-    # Call API
-    for attempt in range(max_retries):
-        try:
-            audio_data = generate_audio_with_elevenlabs(text, voice_id)
-
-            # Cache the result
-            cache_api_response(cache_key, audio_data)
-            return audio_data
-
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise
-            logger.warning(f"⚠️  ElevenLabs API attempt {attempt + 1} failed: {e}")
-            time.sleep(2 ** attempt)
-
-    raise RuntimeError("ElevenLabs API failed after retries")
 # ---------------------------------------------------------------------------
 # HISTORIA RENDERÓW (SQLite)
 # ---------------------------------------------------------------------------
@@ -891,84 +871,6 @@ def generate_nava_video(
 
     return public_url
 
-
-# ---------------------------------------------------------------------------
-# AUDIO: LEKTOR (ElevenLabs)
-# ---------------------------------------------------------------------------
-
-
-def generate_audio_narration(narration_texts, job_id):
-    """Generowanie MP3 z lektorem dla każdej sceny z systemem checkpointów"""
-    if not ELEVENLABS_API_KEY:
-        logger.error("❌ ElevenLabs API key not configured!")
-        raise ValueError("ELEVENLABS_API_KEY not set")
-
-    client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-    audio_files = {}
-
-    for scene_key, text in narration_texts.items():
-        audio_file = os.path.join(tempfile.gettempdir(), f"narration_{scene_key}_{job_id}.mp3")
-
-        if os.path.exists(audio_file):
-            logger.info(f"⏩ Lektor {scene_key} już istnieje. Pomijam ElevenLabs.")
-            # Zakładamy, że funkcja get_audio_duration jest zdefiniowana w dalszej części kodu
-            duration = get_audio_duration(audio_file)
-            audio_files[scene_key] = {
-                "path": audio_file,
-                "duration": duration,
-                "text": text
-            }
-            continue
-
-        logger.info(f"🎙️ Generowanie lektora: {scene_key} ({len(text)} znaków)")
-
-        try:
-            audio_stream = None
-            try:
-                logger.info(f"🎙️ Trying text_to_speech.convert()...")
-                audio_stream = retry_with_backoff(
-                    f"ElevenLabs text_to_speech.convert ({scene_key})",
-                    lambda: client.text_to_speech.convert(
-                        text=text,
-                        voice_id="pNInz6obpgDQGcFmaJgB",
-                        model_id="eleven_multilingual_v2"
-                    )
-                )
-            except Exception as e1:
-                logger.warning(f"⚠️ text_to_speech.convert() failed: {e1}. Trying generate()...")
-                try:
-                    audio_stream = retry_with_backoff(
-                        f"ElevenLabs generate ({scene_key})",
-                        lambda: client.generate(
-                            text=text,
-                            voice="Adam",
-                            model="eleven_multilingual_v2"
-                        )
-                    )
-                    logger.info(f"✅ Fallback to generate() worked!")
-                except Exception as e2:
-                    logger.error(f"❌ Both methods failed: convert={e1}, generate={e2}")
-                    raise e2
-            
-            with open(audio_file, "wb") as f:
-                for chunk in audio_stream:
-                    if chunk:
-                        f.write(chunk)
-            
-            logger.info(f"✅ Lektor dla {scene_key} zapisany pomyślnie.")
-            duration = get_audio_duration(audio_file)
-            
-            audio_files[scene_key] = {
-                "path": audio_file,
-                "duration": duration,
-                "text": text
-            }
-
-        except Exception as e:
-            logger.error(f"❌ Błąd generowania lektora dla {scene_key}: {e}")
-            raise 
-
-    return audio_files
 
 
 def generate_silent_audio_narration(narration_texts, job_id, duration_per_scene=6.0):
@@ -1508,18 +1410,11 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
         if not _stage_done("narration"):
             current_stage = "narration"
             save_checkpoint(job_id, current_stage, data={"topic": topic})
-            if SKIP_NARRATION:
-                logger.info("⏭️  SKIP_NARRATION=true – pomijam ElevenLabs, tworzę ciche ścieżki zastępcze.")
-            else:
-                logger.info("🎙️ Generowanie lektora (ElevenLabs)...")
+            logger.info("🎙️ Generowanie cichych ścieżek zastępczych...")
 
         narration_texts = custom_narration if custom_narration else NARRATION_TEMPLATES
-        if SKIP_NARRATION:
-            audio_files_dict = generate_silent_audio_narration(narration_texts, job_id)
-            logger.info("✅ Ciche ścieżki zastępcze gotowe (SKIP_NARRATION=true)")
-        else:
-            audio_files_dict = generate_audio_narration(narration_texts, job_id)
-            logger.info(f"✅ Lektor wygenerowany")
+        audio_files_dict = generate_silent_audio_narration(narration_texts, job_id)
+        logger.info("✅ Ciche ścieżki zastępcze gotowe")
 
         check_job_timeout()
         srt_file = None
@@ -2004,7 +1899,6 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "storage_dir": STORAGE_DIR,
-        "elevenlabs": "✅ configured" if ELEVENLABS_API_KEY else "❌ not configured",
         "metrics": METRICS,
     })
 
@@ -2118,7 +2012,7 @@ def index():
         "features": {
             "hunyuan_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE) via Hugging Face HunyuanVideo",
             "nava_generation": f"NAVA text-to-video via {NAVA_SPACE_ID} ({'✅ enabled' if NAVA_ENABLED else '❌ disabled'})",
-            "audio_narration": "ElevenLabs (głos Adam)",
+            "audio_narration": "Silent placeholder (local generation)",
             "subtitles": "Whisper API (automatyczna transkrypcja)",
             "watermark": "raport-finansowy24.pl (dolny róg)",
             "endscreen": "Plansza końcowa (3s)",
@@ -2159,7 +2053,6 @@ except Exception as val_err:
 logger.info("🚀 Startup HunyuanVideo API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
 logger.info(f"📁 Storage: {STORAGE_DIR}")
 logger.info(f"🗄️  Database: {DB_PATH}")
-logger.info(f"🎙️ ElevenLabs: {'✅' if ELEVENLABS_API_KEY else '❌'}")
 
 cleanup_old_files(hours=24)
 
