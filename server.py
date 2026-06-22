@@ -811,7 +811,7 @@ def generate_video_segment(prompt, aspect_ratio="9:16"):
     """Generuje pojedynczy klip wideo (HunyuanVideo) i zwraca lokalną ścieżkę tymczasową."""
     logger.info(f"🎬 Generowanie segmentu HunyuanVideo: {prompt[:50]}...")
     temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
-    generate_hunyuan_video_segment(prompt, temp_file, aspect_ratio)
+    generate_wan_video(prompt, temp_file)
     return temp_file
 
 
@@ -1526,7 +1526,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             save_checkpoint(job_id, current_stage, data={"topic": topic, "key": key})
             logger.info(f"🎥 Generowanie sceny HunyuanVideo: {key.upper()}")
 
-            generate_hunyuan_video_segment(prompt_text, stable_path, aspect_ratio)
+            generate_wan_video(prompt_text, stable_path)
 
             segment_files.append(stable_path)
             logger.info(f"✅ Scena {key} gotowa")
