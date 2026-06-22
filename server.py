@@ -720,6 +720,106 @@ def select_best_prompt(variants: list) -> tuple:
 
 
 
+
+# ---------------------------------------------------------------------------
+# STORY PROMPT BUILDER (Gemini → Single 18s Video Prompt)
+# ---------------------------------------------------------------------------
+
+def build_story_prompt(topic: str, narration: dict) -> str:
+    """
+    Build a single professional prompt for 18s Wan2.2 video.
+    Uses Gemini to create coherent story structure with consistent character/environment.
+    """
+    if not GEMINI_CLIENT:
+        raise RuntimeError("GEMINI_CLIENT not initialized")
+    
+    hook = narration.get("hook", "")
+    problem = narration.get("problem", "")
+    solution = narration.get("rozwiązanie", "")
+    
+    logger.info(f"🎬 Building 18s story prompt for topic: {topic}")
+    
+    gemini_prompt = f"""Create a professional 18-second video prompt for Wan2.2 that tells a complete story.
+
+Topic: {topic}
+Hook (0-6s): {hook}
+Problem (6-12s): {problem}
+Solution (12-18s): {solution}
+
+Return ONLY a JSON object (no markdown, no code blocks):
+{{
+  "title": "short title",
+  "hook": "visual description for 0-6s",
+  "problem": "visual description for 6-12s",
+  "solution": "visual description for 12-18s",
+  "camera": "continuous camera movement style",
+  "lighting": "lighting style throughout",
+  "character": "consistent character description",
+  "environment": "consistent location/environment",
+  "style": "visual style (cinematic/professional/energetic)",
+  "negative_prompt": "what to avoid"
+}}
+
+IMPORTANT:
+- Same character throughout all 18 seconds
+- Same location/environment
+- Smooth transitions between sections
+- Professional quality
+- No cuts or scene changes"""
+    
+    try:
+        logger.info("⏳ Calling Gemini to build story structure...")
+        response = GEMINI_CLIENT.generate_content(gemini_prompt)
+        response_text = response.text.strip()
+        
+        # Parse JSON
+        import json
+        if response_text.startswith("```"):
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+        
+        story_data = json.loads(response_text)
+        logger.info(f"✅ Story structure created: {story_data.get('title', 'Untitled')}")
+        
+        # Build final prompt
+        final_prompt = f"""
+{story_data.get('title', topic)} - 18 second cinematic video
+
+NARRATIVE FLOW:
+0-6s (Hook): {story_data.get('hook', '')}
+6-12s (Problem): {story_data.get('problem', '')}
+12-18s (Solution): {story_data.get('solution', '')}
+
+VISUAL CONSISTENCY:
+Character: {story_data.get('character', '')}
+Environment: {story_data.get('environment', '')}
+Camera: {story_data.get('camera', '')}
+Lighting: {story_data.get('lighting', '')}
+Style: {story_data.get('style', '')}
+
+TECHNICAL:
+- Duration: 18 seconds
+- Continuous narrative without cuts
+- Same character and location throughout
+- Professional quality
+- 4K resolution
+
+AVOID: {story_data.get('negative_prompt', 'text overlays, cuts, scene changes')}
+""".strip()
+        
+        logger.info(f"📝 Final prompt length: {len(final_prompt)} chars")
+        return final_prompt
+        
+    except Exception as e:
+        logger.error(f"❌ Gemini error: {e}")
+        # Fallback: simple prompt
+        fallback = f"{topic}. {hook} Then {problem}. Finally {solution}. Professional cinematic 18 second video, same character throughout, no cuts."
+        logger.info(f"⚠️  Using fallback prompt")
+        return fallback
+
+
+
 def generate_wan_video(prompt: str, output_path: str):
     """Generate video via Wan2.2 ZeroGPU Space (free) and save to output_path."""
     logger.info(f"🎬 Wan2.2 (ZeroGPU): generating video for prompt: {prompt[:60]}...")
@@ -1583,53 +1683,38 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             METRICS["jobs_success"] += 1
             return
 
-        # Generate 3 prompt variants and select the best one
+        # Build single 18s story prompt using Gemini
         narration_dict = {
             "hook": custom_narration.get("hook", "") if custom_narration else "",
             "problem": custom_narration.get("problem", "") if custom_narration else "",
             "rozwiązanie": custom_narration.get("rozwiązanie", "") if custom_narration else ""
         }
         
-        # Generate variants for each scene
-        prompts = {}
-        for key in ["hook", "problem", "rozwiązanie"]:
-            variants = generate_prompt_variants(topic, {key: narration_dict[key]})
-            best_prompt, best_idx, best_score = select_best_prompt(variants)
-            prompts[key] = best_prompt
-            logger.info(f"  {key.upper()}: selected variant {best_idx} (score={best_score:.1f})")
-
-        logger.info("📋 Szablon: HOOK → PROBLEM → ROZWIĄZANIE")
-
-        stage_map = {
-            "hook":       "hook_video",
-            "problem":    "problem_video",
-            "rozwiązanie": "solution_video",
-        }
-
-        for key, prompt_text in prompts.items():
-            check_job_timeout()
-            stage_name = stage_map[key]
-
-            # POPRAWKA 1: Pliki dla wznawiania zadań MUSZĄ być w trwałym STORAGE_DIR, nie w ulotnym tempfile
-            stable_path = os.path.join(STORAGE_DIR, f"seg_{job_id}_{key}.mp4")
-
-            if _stage_done(stage_name):
-                if os.path.exists(stable_path):
-                    logger.info(f"⏩ Scena {key.upper()} już istnieje – pomijam HunyuanVideo.")
-                    segment_files.append(stable_path)
-                    continue
-                logger.info(f"⚠️  Plik sceny {key} zaginął ze STORAGE_DIR – regeneruję...")
-
-            current_stage = stage_name
-            save_checkpoint(job_id, current_stage, data={"topic": topic, "key": key})
-            logger.info(f"🎥 Generowanie sceny HunyuanVideo: {key.upper()}")
-
-            generate_wan_video(prompt_text, stable_path)
-
-            segment_files.append(stable_path)
-            logger.info(f"✅ Scena {key} gotowa")
-
-        logger.info(f"✅ Wszystkie 3 sceny gotowe")
+        logger.info("📋 Budowanie spójnego promptu dla 18s wideo")
+        video_prompt = build_story_prompt(topic, narration_dict)
+        
+        # Generate single 18s video
+        check_job_timeout()
+        current_stage = "main_video"
+        save_checkpoint(job_id, current_stage, data={"topic": topic})
+        
+        video_path = os.path.join(STORAGE_DIR, f"main_{job_id}.mp4")
+        
+        if _stage_done("main_video"):
+            if os.path.exists(video_path):
+                logger.info(f"⏩ Główne wideo już istnieje – pomijam generowanie.")
+                segment_files.append(video_path)
+            else:
+                logger.info(f"⚠️  Plik wideo zaginął ze STORAGE_DIR – regeneruję...")
+                logger.info(f"🎥 Generowanie 18s wideo Wan2.2")
+                generate_wan_video(video_prompt, video_path)
+                segment_files.append(video_path)
+        else:
+            logger.info(f"🎥 Generowanie 18s wideo Wan2.2")
+            generate_wan_video(video_prompt, video_path)
+            segment_files.append(video_path)
+        
+        logger.info(f"✅ Główne wideo 18s gotowe")
 
         check_job_timeout()
         if not _stage_done("narration"):
