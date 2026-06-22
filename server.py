@@ -781,7 +781,7 @@ def generate_nava_video(
     """Generate a video using the NAVA Gradio Space and upload it to S3.
 
     Parameters
-    ----------
+    # ----------
     prompt : str
         Text description of the video to generate.
     duration_sec : float
@@ -793,7 +793,7 @@ def generate_nava_video(
         Number of inference steps (default 20).
 
     Returns
-    -------
+    # -------
     str
         Public URL of the uploaded video.
     """
