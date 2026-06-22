@@ -731,7 +731,7 @@ def generate_wan_video(prompt: str, output_path: str):
             logger.info("⏳ Calling Wan2.2 ZeroGPU Space...")
             
             # Use Gradio Client to call Wan2.2 Space (free ZeroGPU)
-            client = Client("Wan-AI/Wan2.2-T2V-A14B", hf_token=os.getenv("HF_TOKEN"))
+            client = Client("Wan-AI/Wan2.2-T2V-A14B")
             result = client.predict(
                 prompt=prompt,
                 api_name="/generate"
