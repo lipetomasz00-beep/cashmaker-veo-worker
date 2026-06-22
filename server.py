@@ -666,13 +666,16 @@ def generate_wan_video(prompt: str, output_path: str):
     if video is None:
         raise RuntimeError("Wan2.2 returned no video (None)")
     
-    if not hasattr(video, 'read'):
-        raise RuntimeError(f"Invalid response from Wan2.2: expected file-like object, got {type(video)}")
-    
+    # Handle both bytes and file-like objects
     try:
-        logger.info(f"💾 Streaming video to {output_path}...")
+        logger.info(f"💾 Saving video to {output_path}...")
         with open(output_path, "wb") as f:
-            shutil.copyfileobj(video, f)
+            if isinstance(video, bytes):
+                f.write(video)
+            elif hasattr(video, 'read'):
+                shutil.copyfileobj(video, f)
+            else:
+                raise RuntimeError(f"Invalid response from Wan2.2: expected bytes or file-like object, got {type(video)}")
         logger.info(f"✅ Video saved to {output_path}")
     except Exception as e:
         logger.error(f"❌ Failed to save video: {e}")
