@@ -57,6 +57,24 @@ def init_hf_client():
         logger.error(f"❌ Failed to initialize HF_CLIENT: {e}")
         raise
 
+# Initialize Google Gemini Client for story prompt building
+GEMINI_CLIENT = None
+
+def init_gemini_client():
+    """Initialize Google Gemini Client for story prompt generation."""
+    global GEMINI_CLIENT
+    try:
+        import google.generativeai as genai
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            raise ValueError("GEMINI_API_KEY environment variable is not set")
+        genai.configure(api_key=gemini_key)
+        GEMINI_CLIENT = genai.GenerativeModel("gemini-1.5-flash")
+        logger.info("✅ Google Gemini Client initialized for story prompts")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize GEMINI_CLIENT: {e}")
+        raise
+
 app = Flask(__name__)
 
 DB_PATH = os.path.join(STORAGE_DIR, 'renders.db')
@@ -240,6 +258,7 @@ def validate_required_env():
     if not ENABLE_DRY_RUN and not IS_TESTING:
         try:
             init_hf_client()
+            init_gemini_client()
         except Exception as e:
             logger.error(f"Failed to initialize HF_CLIENT: {e}")
             raise
