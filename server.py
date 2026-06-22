@@ -1899,10 +1899,38 @@ def start_render_sequence():
         if cached:
             return jsonify(cached["body"]), cached["status"]
 
+    # Extract topic from various sources (support Gemini/Make.com structure)
     topic = data.get("topic", "").strip()
     
+    # Fallback 1: Try to extract from video.style or video description
     if not topic:
-        return jsonify({"error": "Missing or empty 'topic'"}), 400
+        video = data.get("video", {})
+        if isinstance(video, dict):
+            topic = video.get("style", "").strip()
+    
+    # Fallback 2: Try to extract from character description
+    if not topic:
+        character = data.get("character", {})
+        if isinstance(character, dict):
+            topic = character.get("description", "").strip()
+            # Take first 50 chars as topic
+            if topic:
+                topic = topic[:50]
+    
+    # Fallback 3: Try to extract from storyboard
+    if not topic:
+        storyboard = data.get("storyboard", [])
+        if isinstance(storyboard, list) and len(storyboard) > 0:
+            first_scene = storyboard[0]
+            if isinstance(first_scene, dict):
+                topic = first_scene.get("description", "").strip()
+                if topic:
+                    topic = topic[:50]
+    
+    if not topic:
+        return jsonify({
+            "error": "Missing 'topic' field. Provide one of: topic, video.style, character.description, or storyboard[0].description"
+        }), 400
     
     webhook_url = data.get("webhookUrl")
     job_id = str(uuid.uuid4())
