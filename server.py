@@ -1098,6 +1098,22 @@ def get_audio_duration(audio_file):
         logger.warning(f"⚠️ Nie udało się pobrać czasu trwania {audio_file}: {e}")
         return 5.0
 
+
+def ffmpeg_supports_subtitles():
+    """Check if FFmpeg has libass support for subtitles filter."""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-filters'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        # Check if 'subtitles' filter is available
+        return 'subtitles' in result.stdout
+    except Exception as e:
+        logger.warning(f"⚠️ Could not check FFmpeg filters: {e}")
+        return False
+
 def get_video_duration(video_file):
     """Pobranie czasu trwania wideo za pomocą ffprobe"""
     try:
@@ -1229,16 +1245,19 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
 
     # BŁĄD LOGICZNY USUNIĘTY: Skoro speed robimy w innej funkcji, tu dajemy zwykłe kopiowanie strumienia video (bez setpts)
     # Zostawiamy po prostu wejście wideo bez modyfikacji czasu, żeby nie podwoić przyspieszenia.
-    video_filter = "[0:v]copy" if srt_file is None else "[0:v]format=yuv420p"
 
     # Budujemy łańcuch filtrów
     filters = []
 
     if srt_file and os.path.exists(srt_file):
-        srt_path_escaped = srt_file.replace("\\", "\\\\").replace(":", "\\:")
-        # Eleganckie, wyraźne napisy dopasowane do profesjonalnego brandingu
-        filters.append(f"subtitles='{srt_path_escaped}':force_style='FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2,Shadow=0'")
-        logger.info(f"✅ Napisy będą wypalane")
+        if ffmpeg_supports_subtitles():
+            srt_path_escaped = srt_file.replace("\\", "\\\\").replace(":", "\\:")
+            # Eleganckie, wyraźne napisy dopasowane do profesjonalnego brandingu
+            filters.append(f"subtitles='{srt_path_escaped}':force_style='FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2,Shadow=0'")
+            logger.info(f"✅ Napisy będą wypalane")
+
+        else:
+            logger.warning("⚠️ FFmpeg subtitles filter not available (libass missing). Skipping subtitles.")
 
     watermark_text = "raport-finansowy24.pl"
     filters.append(f"drawtext=text='{watermark_text}':x=w-text_w-20:y=h-text_h-20:fontsize=24:fontcolor=white@0.7:box=1:boxcolor=black@0.5")
