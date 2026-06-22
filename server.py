@@ -1229,7 +1229,6 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
 
     # BŁĄD LOGICZNY USUNIĘTY: Skoro speed robimy w innej funkcji, tu dajemy zwykłe kopiowanie strumienia video (bez setpts)
     # Zostawiamy po prostu wejście wideo bez modyfikacji czasu, żeby nie podwoić przyspieszenia.
-    video_filter = "[0:v]copy" if srt_file is None else "[0:v]format=yuv420p"
 
     # Budujemy łańcuch filtrów
     filters = []
