@@ -37,6 +37,26 @@ def run_ffmpeg(cmd, timeout=120):
         raise
 
 
+# Initialize HuggingFace Inference Client for Wan2.2
+HF_CLIENT = None
+
+def init_hf_client():
+    """Initialize HuggingFace Inference Client for Wan2.2 video generation."""
+    global HF_CLIENT
+    try:
+        from huggingface_hub import InferenceClient
+        hf_token = os.getenv("HF_TOKEN")
+        if not hf_token:
+            raise ValueError("HF_TOKEN environment variable is not set")
+        HF_CLIENT = InferenceClient(
+            provider="fal-ai",
+            api_key=hf_token,
+        )
+        logger.info("✅ HuggingFace Inference Client initialized for Wan2.2")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize HF_CLIENT: {e}")
+        raise
+
 app = Flask(__name__)
 
 DB_PATH = os.path.join(STORAGE_DIR, 'renders.db')
@@ -605,6 +625,53 @@ def get_render_from_db(job_id):
 # GENEROWANIE SEGMENTÓW WIDEO (Hugging Face HunyuanVideo)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# GENEROWANIE WIDEO: Wan2.2 (FAL AI via HuggingFace Inference)
+# ---------------------------------------------------------------------------
+
+def generate_wan_video(prompt: str, output_path: str):
+    """Generate video via Wan2.2 (FAL AI) and save to output_path."""
+    if not HF_CLIENT:
+        raise RuntimeError("HF_CLIENT not initialized. Call init_hf_client() first.")
+    
+    logger.info(f"🎬 Wan2.2: generating video for prompt: {prompt[:60]}...")
+    
+    def _call_wan_api():
+        start_time = time.time()
+        try:
+            logger.info("⏳ Calling Wan2.2 via HuggingFace Inference API...")
+            video = HF_CLIENT.text_to_video(
+                prompt,
+                model="Wan-AI/Wan2.2-T2V-A14B",
+            )
+            elapsed = time.time() - start_time
+            logger.info(f"✅ Wan2.2 generated video in {elapsed:.2f}s")
+            return video
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"❌ Wan2.2 API error after {elapsed:.2f}s: {e}")
+            raise
+    
+    video = retry_with_backoff("Wan2.2 generation", _call_wan_api, max_retries=3, base_delay=30)
+    
+    if video is None:
+        raise RuntimeError("Wan2.2 returned no video (None)")
+    
+    if not hasattr(video, 'read'):
+        raise RuntimeError(f"Invalid response from Wan2.2: expected file-like object, got {type(video)}")
+    
+    try:
+        logger.info(f"💾 Streaming video to {output_path}...")
+        with open(output_path, "wb") as f:
+            shutil.copyfileobj(video, f)
+        logger.info(f"✅ Video saved to {output_path}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save video: {e}")
+        raise
+    
+    return output_path
+
+
 def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
     """Generate a video segment via LTX 2.3 Gradio Space and save it directly to output_path."""
 
@@ -1052,6 +1119,7 @@ def generate_end_screen(job_id, topic, output_path):
         '-loop', '1', '-i', img_path,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-pix_fmt', 'yuv420p',
         '-t', '3',  # 3 sekund
+        '-movflags', '+faststart',
         output_path
     ]
     
@@ -1082,6 +1150,7 @@ def add_watermark(video_path, output_path, watermark_text="raport-finansowy24.pl
         ),
         '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
+        '-movflags', '+faststart',
         output_path
     ]
     
@@ -1201,6 +1270,7 @@ def generate_video_with_speed_adjustment(segment_files, speed=1.0):
             '-af', build_atempo_chain(speed),
             '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2',
             '-c:a', 'aac',
+            '-movflags', '+faststart',
             output_file
         ]
         
@@ -1236,6 +1306,7 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_file_path,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
+        '-movflags', '+faststart',
         concat_output
     ]
     run_ffmpeg(ffmpeg_concat_cmd, timeout=120)
