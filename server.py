@@ -26,6 +26,17 @@ STORAGE_DIR = os.getenv('STORAGE_DIR', '/app/data')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
+def run_ffmpeg(cmd, timeout=120):
+    """Run FFmpeg command with proper error logging."""
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg error: {e}")
+        if e.stderr:
+            logger.error(e.stderr.decode(errors='ignore'))
+        raise
+
+
 app = Flask(__name__)
 
 DB_PATH = os.path.join(STORAGE_DIR, 'renders.db')
@@ -1044,7 +1055,7 @@ def generate_end_screen(job_id, topic, output_path):
         output_path
     ]
     
-    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    run_ffmpeg(ffmpeg_cmd, timeout=60)
     logger.info(f"✅ Plansza MP4: {output_path}")
     
     if os.path.exists(img_path):
@@ -1074,7 +1085,7 @@ def add_watermark(video_path, output_path, watermark_text="raport-finansowy24.pl
         output_path
     ]
     
-    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    run_ffmpeg(ffmpeg_cmd, timeout=180)
     logger.info(f"✅ Watermark dodany")
     
     return output_path
@@ -1154,6 +1165,22 @@ def calculate_video_speed(audio_files, target_duration=18):
     
     return speed
 
+def build_atempo_chain(speed):
+    """Build atempo filter chain for speeds outside 0.5-2.0 range."""
+    if speed < 0.5:
+        return "atempo=0.5"
+    elif speed <= 2.0:
+        return f"atempo={speed}"
+    else:
+        filters = []
+        remaining_speed = speed
+        while remaining_speed > 2.0:
+            filters.append("atempo=2.0")
+            remaining_speed /= 2.0
+        filters.append(f"atempo={remaining_speed:.2f}")
+        return ",".join(filters)
+
+
 def generate_video_with_speed_adjustment(segment_files, speed=1.0):
     """Generowanie wideo ze zmienioną prędkością"""
     if speed == 1.0:
@@ -1171,14 +1198,14 @@ def generate_video_with_speed_adjustment(segment_files, speed=1.0):
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-i', video_file,
             '-vf', f"setpts=PTS/{speed}",
-            '-af', f"atempo={speed}",
+            '-af', build_atempo_chain(speed),
             '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2',
             '-c:a', 'aac',
             output_file
         ]
         
         logger.info(f"  ⏱️ Segment {i}: {speed:.2f}x")
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        run_ffmpeg(ffmpeg_cmd, timeout=180)
         
         speed_adjusted_files.append(output_file)
     
@@ -1207,10 +1234,11 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
     concat_output = os.path.join(tempfile.gettempdir(), f"concat_{job_id}.mp4")
     ffmpeg_concat_cmd = [
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_file_path,
-        '-c', 'copy',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '128k',
         concat_output
     ]
-    subprocess.run(ffmpeg_concat_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    run_ffmpeg(ffmpeg_concat_cmd, timeout=120)
     logger.info(f"✅ Wideo połączone: {concat_output}")
     
     logger.info("🎙️ Etap 2: Miksowanie audio (lektory)...")
@@ -1236,7 +1264,7 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
             '-c:a', 'libmp3lame', '-q:a', '4',
             combined_audio
         ]
-        subprocess.run(ffmpeg_audio_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        run_ffmpeg(ffmpeg_audio_concat, timeout=120)
         logger.info(f"✅ Lektory połączone: {combined_audio}")
     else:
         logger.info("⏭️  Brak ścieżek audio – montaż wideo bez dźwięku.")
@@ -1292,7 +1320,7 @@ def concat_video_with_audio_and_subtitles(video_files, audio_files, srt_file, jo
         ]
 
     logger.info("🔄 Kodowanie finale (może potrwać trochę)...")
-    subprocess.run(ffmpeg_final_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    run_ffmpeg(ffmpeg_final_cmd, timeout=300)
     logger.info(f"✅ Finalne wideo: {output_path}")
 
     cleanup_files = [list_file_path, concat_output]
@@ -1459,7 +1487,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
                 # ZABEZPIECZENIE: Try-except dla łączenia audio
                 try:
-                    subprocess.run(ffmpeg_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                    run_ffmpeg(ffmpeg_concat, timeout=120)
                     srt_file = generate_subtitles_from_audio(combined_for_transcription, job_id)
                 except subprocess.CalledProcessError as e:
                     logger.error(f"❌ Błąd FFmpeg przy łączeniu audio dla Whispera: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'Brak'}")
@@ -1516,13 +1544,14 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
         ffmpeg_final_concat = [
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list,
-            '-c', 'copy',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '128k',
             final_with_endscreen
         ]
         
         # ZABEZPIECZENIE: Łapanie błędu krytycznego podczas finałowego sklejania
         try:
-            subprocess.run(ffmpeg_final_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            run_ffmpeg(ffmpeg_final_concat, timeout=120)
             shutil.move(final_with_endscreen, final_output_path)
             logger.info(f"✅ Plansza końcowa dodana")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
