@@ -638,6 +638,88 @@ def get_render_from_db(job_id):
 # GENEROWANIE WIDEO: Wan2.2 (FAL AI via HuggingFace Inference)
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# PROMPT OPTIMIZATION (3 warianty → scoring → best pick)
+# ---------------------------------------------------------------------------
+
+def generate_prompt_variants(topic: str, narration: dict) -> list:
+    """Generate 3 prompt variants for video generation."""
+    if not HF_CLIENT:
+        raise RuntimeError("HF_CLIENT not initialized")
+    
+    hook = narration.get("hook", "")
+    problem = narration.get("problem", "")
+    solution = narration.get("rozwiązanie", "")
+    
+    logger.info(f"🎨 Generating 3 prompt variants for topic: {topic}")
+    
+    # Variant 1: Cinematic + emotional
+    variant1 = f"Cinematic shot, dramatic lighting, emotional expression. {hook[:50]}. Problem: {problem[:50]}. Solution: {solution[:50]}"
+    
+    # Variant 2: Dynamic + energetic
+    variant2 = f"Dynamic fast-paced scene, vibrant colors, energetic movement. {hook[:50]}. {problem[:50]}. {solution[:50]}"
+    
+    # Variant 3: Professional + clear
+    variant3 = f"Professional presentation, clear visuals, informative. Topic: {topic}. Key message: {hook[:50]}. Details: {problem[:50]}"
+    
+    variants = [variant1, variant2, variant3]
+    
+    for i, v in enumerate(variants, 1):
+        logger.info(f"  Variant {i}: {v[:60]}...")
+    
+    return variants
+
+
+def score_prompt(prompt: str) -> float:
+    """Score a prompt based on quality metrics."""
+    score = 0.0
+    
+    # Length score (optimal 100-200 chars)
+    length = len(prompt)
+    if 100 <= length <= 200:
+        score += 30
+    elif 50 <= length <= 250:
+        score += 20
+    else:
+        score += 10
+    
+    # Keyword diversity
+    keywords = ["cinematic", "dynamic", "professional", "visual", "scene", "shot", "color", "movement"]
+    keyword_count = sum(1 for kw in keywords if kw.lower() in prompt.lower())
+    score += min(keyword_count * 5, 30)
+    
+    # Descriptive words
+    descriptive = ["dramatic", "vibrant", "energetic", "clear", "emotional", "fast-paced", "professional"]
+    desc_count = sum(1 for d in descriptive if d.lower() in prompt.lower())
+    score += min(desc_count * 5, 25)
+    
+    # Avoid repetition
+    words = prompt.lower().split()
+    unique_ratio = len(set(words)) / max(len(words), 1)
+    score += unique_ratio * 15
+    
+    return min(score, 100.0)
+
+
+def select_best_prompt(variants: list) -> tuple:
+    """Select best prompt from variants based on scoring."""
+    logger.info("🎯 Scoring prompt variants...")
+    
+    scores = []
+    for i, variant in enumerate(variants, 1):
+        score = score_prompt(variant)
+        scores.append((i, variant, score))
+        logger.info(f"  Variant {i}: score={score:.1f}")
+    
+    # Select best
+    best_idx, best_prompt, best_score = max(scores, key=lambda x: x[2])
+    logger.info(f"✅ Selected variant {best_idx} (score={best_score:.1f})")
+    
+    return best_prompt, best_idx, best_score
+
+
+
 def generate_wan_video(prompt: str, output_path: str):
     """Generate video via Wan2.2 (FAL AI) and save to output_path."""
     if not HF_CLIENT:
@@ -1497,11 +1579,20 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             METRICS["jobs_success"] += 1
             return
 
-        prompts = {
-            "hook": f"Dynamic cinematic shot, extreme close up, shock and stress, concept of {topic}, corporate finance style, 4k, professional",
-            "problem": f"A person looking anxiously at bills and charts on a screen, dark moody lighting, financial stress, 4k, professional",
-            "rozwiązanie": f"Bright clean studio lighting, a smartphone screen displaying green rising financial growth charts, relief, 4k, professional"
+        # Generate 3 prompt variants and select the best one
+        narration_dict = {
+            "hook": narration.get("hook", ""),
+            "problem": narration.get("problem", ""),
+            "rozwiązanie": narration.get("rozwiązanie", "")
         }
+        
+        # Generate variants for each scene
+        prompts = {}
+        for key in ["hook", "problem", "rozwiązanie"]:
+            variants = generate_prompt_variants(topic, {key: narration_dict[key]})
+            best_prompt, best_idx, best_score = select_best_prompt(variants)
+            prompts[key] = best_prompt
+            logger.info(f"  {key.upper()}: selected variant {best_idx} (score={best_score:.1f})")
 
         logger.info("📋 Szablon: HOOK → PROBLEM → ROZWIĄZANIE")
 
