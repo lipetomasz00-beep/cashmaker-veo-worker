@@ -64,12 +64,12 @@ def init_gemini_client():
     """Initialize Google Gemini Client for story prompt generation."""
     global GEMINI_CLIENT
     try:
-        import google.generativeai as genai
+        import google.genai as genai
         gemini_key = os.getenv("GEMINI_API_KEY")
         if not gemini_key:
             raise ValueError("GEMINI_API_KEY environment variable is not set")
         genai.configure(api_key=gemini_key)
-        GEMINI_CLIENT = genai.GenerativeModel("gemini-1.5-flash")
+        GEMINI_CLIENT = genai.Client(api_key=gemini_key).models.generate_content
         logger.info("✅ Google Gemini Client initialized for story prompts")
     except Exception as e:
         logger.error(f"❌ Failed to initialize GEMINI_CLIENT: {e}")
@@ -703,7 +703,10 @@ Respond with a JSON object in this exact format:
 Only output the JSON, nothing else."""
 
     def _call_gemini():
-        response = GEMINI_CLIENT.generate_content(gemini_prompt)
+        response = GEMINI_CLIENT.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=gemini_prompt
+        )
         return response.text.strip()
 
     try:
