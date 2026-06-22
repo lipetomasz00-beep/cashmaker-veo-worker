@@ -721,43 +721,47 @@ def select_best_prompt(variants: list) -> tuple:
 
 
 def generate_wan_video(prompt: str, output_path: str):
-    """Generate video via Wan2.2 (FAL AI) and save to output_path."""
-    if not HF_CLIENT:
-        raise RuntimeError("HF_CLIENT not initialized. Call init_hf_client() first.")
+    """Generate video via Wan2.2 ZeroGPU Space (free) and save to output_path."""
+    logger.info(f"🎬 Wan2.2 (ZeroGPU): generating video for prompt: {prompt[:60]}...")
     
-    logger.info(f"🎬 Wan2.2: generating video for prompt: {prompt[:60]}...")
-    
-    def _call_wan_api():
+    def _call_wan_space():
         start_time = time.time()
         try:
-            logger.info("⏳ Calling Wan2.2 via HuggingFace Inference API...")
-            video = HF_CLIENT.text_to_video(
-                prompt,
-                model="Wan-AI/Wan2.2-T2V-A14B",
+            from gradio_client import Client
+            logger.info("⏳ Calling Wan2.2 ZeroGPU Space...")
+            
+            # Use Gradio Client to call Wan2.2 Space (free ZeroGPU)
+            client = Client("Wan-AI/Wan2.2-T2V-A14B", hf_token=os.getenv("HF_TOKEN"))
+            result = client.predict(
+                prompt=prompt,
+                api_name="/generate"
             )
+            
             elapsed = time.time() - start_time
             logger.info(f"✅ Wan2.2 generated video in {elapsed:.2f}s")
-            return video
+            return result
         except Exception as e:
             elapsed = time.time() - start_time
-            logger.error(f"❌ Wan2.2 API error after {elapsed:.2f}s: {e}")
+            logger.error(f"❌ Wan2.2 Space error after {elapsed:.2f}s: {e}")
             raise
     
-    video = retry_with_backoff("Wan2.2 generation", _call_wan_api, max_retries=3, base_delay=30)
+    result = retry_with_backoff("Wan2.2 ZeroGPU", _call_wan_space, max_retries=3, base_delay=30)
     
-    if video is None:
-        raise RuntimeError("Wan2.2 returned no video (None)")
+    if result is None:
+        raise RuntimeError("Wan2.2 returned no result (None)")
     
-    # Handle both bytes and file-like objects
+    # Result is a file path from the Space
     try:
-        logger.info(f"💾 Saving video to {output_path}...")
-        with open(output_path, "wb") as f:
-            if isinstance(video, bytes):
-                f.write(video)
-            elif hasattr(video, 'read'):
-                shutil.copyfileobj(video, f)
-            else:
-                raise RuntimeError(f"Invalid response from Wan2.2: expected bytes or file-like object, got {type(video)}")
+        logger.info(f"💾 Downloading video from Space...")
+        if isinstance(result, str) and result.startswith("http"):
+            # Download from URL
+            import urllib.request
+            urllib.request.urlretrieve(result, output_path)
+        elif isinstance(result, str) and os.path.exists(result):
+            # Local file path
+            shutil.copy(result, output_path)
+        else:
+            raise RuntimeError(f"Invalid response from Wan2.2: expected file path or URL, got {type(result)}")
         logger.info(f"✅ Video saved to {output_path}")
     except Exception as e:
         logger.error(f"❌ Failed to save video: {e}")
