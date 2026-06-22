@@ -68,8 +68,7 @@ def init_gemini_client():
         gemini_key = os.getenv("GEMINI_API_KEY")
         if not gemini_key:
             raise ValueError("GEMINI_API_KEY environment variable is not set")
-        genai.configure(api_key=gemini_key)
-        GEMINI_CLIENT = genai.Client(api_key=gemini_key).models.generate_content
+        GEMINI_CLIENT = genai.Client(api_key=gemini_key)
         logger.info("✅ Google Gemini Client initialized for story prompts")
     except Exception as e:
         logger.error(f"❌ Failed to initialize GEMINI_CLIENT: {e}")
@@ -704,7 +703,7 @@ Only output the JSON, nothing else."""
 
     def _call_gemini():
         response = GEMINI_CLIENT.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash",
             contents=gemini_prompt
         )
         return response.text.strip()
