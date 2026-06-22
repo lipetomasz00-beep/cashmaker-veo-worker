@@ -1581,9 +1581,9 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
 
         # Generate 3 prompt variants and select the best one
         narration_dict = {
-            "hook": narration.get("hook", ""),
-            "problem": narration.get("problem", ""),
-            "rozwiązanie": narration.get("rozwiązanie", "")
+            "hook": custom_narration.get("hook", "") if custom_narration else "",
+            "problem": custom_narration.get("problem", "") if custom_narration else "",
+            "rozwiązanie": custom_narration.get("rozwiązanie", "") if custom_narration else ""
         }
         
         # Generate variants for each scene
