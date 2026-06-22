@@ -650,7 +650,7 @@ def get_render_from_db(job_id):
     return None
 
 # ---------------------------------------------------------------------------
-# GENEROWANIE SEGMENTÓW WIDEO (Hugging Face HunyuanVideo)
+# GENEROWANIE WIDEO: Wan2.2 (FAL AI via HuggingFace Inference)
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -917,7 +917,7 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
 
 
 def generate_video_segment(prompt, aspect_ratio="9:16"):
-    """Generuje pojedynczy klip wideo (HunyuanVideo) i zwraca lokalną ścieżkę tymczasową."""
+    """Generuje pojedynczy klip wideo (Wan2.2) i zwraca lokalną ścieżkę tymczasową."""
     logger.info(f"🎬 Generowanie segmentu HunyuanVideo: {prompt[:50]}...")
     temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
     generate_wan_video(prompt, temp_file)
@@ -2239,7 +2239,7 @@ def index():
         "name": "HunyuanVideo API",
         "version": "4.1.0",
         "features": {
-            "hunyuan_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE) via Hugging Face HunyuanVideo",
+            "hunyuan_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE) via Wan2.2",
             "nava_generation": f"NAVA text-to-video via {NAVA_SPACE_ID} ({'✅ enabled' if NAVA_ENABLED else '❌ disabled'})",
             "audio_narration": "Silent placeholder (local generation)",
             "subtitles": "Whisper API (automatyczna transkrypcja)",
@@ -2249,7 +2249,7 @@ def index():
             "checkpoint_resume": "Pause/resume – wznowienie od ostatniego etapu"
         },
         "endpoints": {
-            "POST /render-sequence": "Uruchomienie renderowania (HunyuanVideo)",
+            "POST /render-sequence": "Uruchomienie renderowania (Wan2.2)",
             "POST /nava-generate": "Generowanie wideo NAVA (text-to-video)",
             "GET /tasks/<job_id>": "Status renderowania",
             "POST /resume/<job_id>": "Wznowienie wstrzymanego zadania od checkpointu",
@@ -2277,7 +2277,7 @@ except Exception as val_err:
 # ---------------------------------------------------------------------------
 # STARTUP INITIALIZATION (runs on import by Gunicorn or direct execution)
 # ---------------------------------------------------------------------------
-logger.info("🚀 Startup HunyuanVideo API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
+logger.info("🚀 Startup Wan2.2 API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
 logger.info(f"📁 Storage: {STORAGE_DIR}")
 logger.info(f"🗄️  Database: {DB_PATH}")
 
