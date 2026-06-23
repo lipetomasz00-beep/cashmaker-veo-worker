@@ -746,6 +746,64 @@ Only output the JSON, nothing else."""
 # GENEROWANIE WIDEO: Wan2.2 (FAL AI via HuggingFace Inference)
 # ---------------------------------------------------------------------------
 
+
+def build_story_prompt(topic: str, narration: dict) -> str:
+    """Use Gemini to build a single coherent 18s video prompt for Gradio Space (LTX 2.3).
+
+    Takes the topic and narration dict (with keys: hook, problem, rozwiązanie)
+    and asks Gemini to synthesise them into one professional video prompt that
+    maintains a consistent character and environment throughout the full 18-second
+    clip.
+
+    Returns a single prompt string.  Falls back to a sensible default if Gemini
+    is unavailable or returns an unparseable response.
+    """
+    hook_text = narration.get("hook", "")
+    problem_text = narration.get("problem", "")
+    solution_text = narration.get("rozwiązanie", "")
+
+    fallback_prompt = (
+        f"Cinematic 18-second financial story about {topic}. "
+        "A professional in a modern office environment: first looking stressed at financial documents, "
+        "then discovering a solution on a smartphone showing green growth charts, "
+        "finally smiling with relief. Consistent character, warm studio lighting, 4K, professional."
+    )
+
+    if not GEMINI_CLIENT:
+        logger.warning("⚠️ GEMINI_CLIENT not available – using fallback story prompt.")
+        return fallback_prompt
+
+    gemini_prompt = f"""You are a professional video director creating a single 18-second cinematic video for LTX 2.3 text-to-video model.
+
+Topic: {topic}
+Hook (0-6s): {hook_text}
+Problem (6-12s): {problem_text}
+Solution (12-18s): {solution_text}
+
+Create ONE cohesive LTX 2.3 video prompt that:
+1. Covers all three narrative phases in a single continuous shot or seamless transitions
+2. Maintains a consistent character, environment, and visual style throughout
+3. Uses professional, cinematic language suitable for a high-quality video model
+4. Includes specific visual details (lighting, camera movement, props, colors)
+5. Emphasizes the emotional arc: tension → discovery → resolution
+6. Is concise but vivid (150-250 words)
+
+Return ONLY the video prompt, no explanations or JSON."""
+
+    try:
+        def _call_gemini():
+            response = GEMINI_CLIENT.generate_content(gemini_prompt)
+            return response.text.strip()
+
+        story_prompt = retry_with_backoff("Gemini story prompt", _call_gemini, max_retries=2, base_delay=5)
+        logger.info(f"✅ Gemini story prompt generated: {story_prompt[:80]}...")
+        return story_prompt
+    except Exception as e:
+        logger.warning(f"⚠️ Gemini story prompt failed ({e}) – using fallback.")
+        return fallback_prompt
+
+
+
 def generate_wan_video(prompt: str, output_path: str):
     """Generate video via Wan2.2 (FAL AI) and save to output_path."""
     if not HF_CLIENT:
