@@ -64,12 +64,11 @@ def init_gemini_client():
     """Initialize Google Gemini Client for story prompt generation."""
     global GEMINI_CLIENT
     try:
-        import google.generativeai as genai
+        import google.genai as genai
         gemini_key = os.getenv("GEMINI_API_KEY")
         if not gemini_key:
             raise ValueError("GEMINI_API_KEY environment variable is not set")
-        genai.configure(api_key=gemini_key)
-        GEMINI_CLIENT = genai.GenerativeModel("gemini-1.5-flash")
+        GEMINI_CLIENT = genai.Client(api_key=gemini_key)
         logger.info("✅ Google Gemini Client initialized for story prompts")
     except Exception as e:
         logger.error(f"❌ Failed to initialize GEMINI_CLIENT: {e}")
@@ -650,7 +649,7 @@ def get_render_from_db(job_id):
     return None
 
 # ---------------------------------------------------------------------------
-# GENEROWANIE SEGMENTÓW WIDEO (Hugging Face HunyuanVideo)
+# GENEROWANIE WIDEO: Wan2.2 (FAL AI via HuggingFace Inference)
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -703,7 +702,10 @@ Respond with a JSON object in this exact format:
 Only output the JSON, nothing else."""
 
     def _call_gemini():
-        response = GEMINI_CLIENT.generate_content(gemini_prompt)
+        response = GEMINI_CLIENT.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=gemini_prompt
+        )
         return response.text.strip()
 
     try:
@@ -743,6 +745,64 @@ Only output the JSON, nothing else."""
 # ---------------------------------------------------------------------------
 # GENEROWANIE WIDEO: Wan2.2 (FAL AI via HuggingFace Inference)
 # ---------------------------------------------------------------------------
+
+
+def build_story_prompt(topic: str, narration: dict) -> str:
+    """Use Gemini to build a single coherent 18s video prompt for Gradio Space (LTX 2.3).
+
+    Takes the topic and narration dict (with keys: hook, problem, rozwiązanie)
+    and asks Gemini to synthesise them into one professional video prompt that
+    maintains a consistent character and environment throughout the full 18-second
+    clip.
+
+    Returns a single prompt string.  Falls back to a sensible default if Gemini
+    is unavailable or returns an unparseable response.
+    """
+    hook_text = narration.get("hook", "")
+    problem_text = narration.get("problem", "")
+    solution_text = narration.get("rozwiązanie", "")
+
+    fallback_prompt = (
+        f"Cinematic 18-second financial story about {topic}. "
+        "A professional in a modern office environment: first looking stressed at financial documents, "
+        "then discovering a solution on a smartphone showing green growth charts, "
+        "finally smiling with relief. Consistent character, warm studio lighting, 4K, professional."
+    )
+
+    if not GEMINI_CLIENT:
+        logger.warning("⚠️ GEMINI_CLIENT not available – using fallback story prompt.")
+        return fallback_prompt
+
+    gemini_prompt = f"""You are a professional video director creating a single 18-second cinematic video for LTX 2.3 text-to-video model.
+
+Topic: {topic}
+Hook (0-6s): {hook_text}
+Problem (6-12s): {problem_text}
+Solution (12-18s): {solution_text}
+
+Create ONE cohesive LTX 2.3 video prompt that:
+1. Covers all three narrative phases in a single continuous shot or seamless transitions
+2. Maintains a consistent character, environment, and visual style throughout
+3. Uses professional, cinematic language suitable for a high-quality video model
+4. Includes specific visual details (lighting, camera movement, props, colors)
+5. Emphasizes the emotional arc: tension → discovery → resolution
+6. Is concise but vivid (150-250 words)
+
+Return ONLY the video prompt, no explanations or JSON."""
+
+    try:
+        def _call_gemini():
+            response = GEMINI_CLIENT.generate_content(gemini_prompt)
+            return response.text.strip()
+
+        story_prompt = retry_with_backoff("Gemini story prompt", _call_gemini, max_retries=2, base_delay=5)
+        logger.info(f"✅ Gemini story prompt generated: {story_prompt[:80]}...")
+        return story_prompt
+    except Exception as e:
+        logger.warning(f"⚠️ Gemini story prompt failed ({e}) – using fallback.")
+        return fallback_prompt
+
+
 
 def generate_wan_video(prompt: str, output_path: str):
     """Generate video via Wan2.2 (FAL AI) and save to output_path."""
@@ -914,10 +974,10 @@ def generate_hunyuan_video_segment(prompt, output_path, aspect_ratio="9:16"):
 
 
 def generate_video_segment(prompt, aspect_ratio="9:16"):
-    """Generuje pojedynczy klip wideo (HunyuanVideo) i zwraca lokalną ścieżkę tymczasową."""
+    """Generuje pojedynczy klip wideo (Wan2.2) i zwraca lokalną ścieżkę tymczasową."""
     logger.info(f"🎬 Generowanie segmentu HunyuanVideo: {prompt[:50]}...")
     temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
-    generate_wan_video(prompt, temp_file)
+    generate_hunyuan_video_segment(prompt, temp_file)
     return temp_file
 
 
@@ -969,7 +1029,7 @@ def generate_nava_video(
     prompt,
     duration_sec=6.0,
     aspect_ratio="1:1 (960×960)",
-    steps=20.0,
+    steps=4.0,  # TESTING: minimum quality
 ):
     """Generate a video using the NAVA Gradio Space and upload it to S3.
 
@@ -1624,7 +1684,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             story_prompt = build_story_prompt(topic, narration_for_prompt)
 
             logger.info("🎥 Generowanie głównego wideo 18s (Wan2.2)...")
-            generate_wan_video(story_prompt, main_video_path)
+            generate_hunyuan_video_segment(story_prompt, main_video_path)
 
             segment_files.append(main_video_path)
             logger.info("✅ Główne wideo 18s gotowe")
@@ -1897,10 +1957,38 @@ def start_render_sequence():
         if cached:
             return jsonify(cached["body"]), cached["status"]
 
+    # Extract topic from various sources (support Gemini/Make.com structure)
     topic = data.get("topic", "").strip()
     
+    # Fallback 1: Try to extract from video.style or video description
     if not topic:
-        return jsonify({"error": "Missing or empty 'topic'"}), 400
+        video = data.get("video", {})
+        if isinstance(video, dict):
+            topic = video.get("style", "").strip()
+    
+    # Fallback 2: Try to extract from character description
+    if not topic:
+        character = data.get("character", {})
+        if isinstance(character, dict):
+            topic = character.get("description", "").strip()
+            # Take first 50 chars as topic
+            if topic:
+                topic = topic[:50]
+    
+    # Fallback 3: Try to extract from storyboard
+    if not topic:
+        storyboard = data.get("storyboard", [])
+        if isinstance(storyboard, list) and len(storyboard) > 0:
+            first_scene = storyboard[0]
+            if isinstance(first_scene, dict):
+                topic = first_scene.get("description", "").strip()
+                if topic:
+                    topic = topic[:50]
+    
+    if not topic:
+        return jsonify({
+            "error": "Missing 'topic' field. Provide one of: topic, video.style, character.description, or storyboard[0].description"
+        }), 400
     
     webhook_url = data.get("webhookUrl")
     job_id = str(uuid.uuid4())
@@ -2188,7 +2276,7 @@ def nava_generate():
     aspect_ratio = str(data.get("aspect_ratio", "1:1 (960×960)"))
 
     try:
-        steps = float(data.get("steps", 20))
+        steps = float(data.get("steps", 4))  # TESTING: minimum quality
     except (TypeError, ValueError):
         return jsonify({"error": "'steps' must be a number"}), 400
 
@@ -2236,7 +2324,7 @@ def index():
         "name": "HunyuanVideo API",
         "version": "4.1.0",
         "features": {
-            "hunyuan_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE) via Hugging Face HunyuanVideo",
+            "hunyuan_generation": "3 sceny (HOOK/PROBLEM/ROZWIĄZANIE) via Wan2.2",
             "nava_generation": f"NAVA text-to-video via {NAVA_SPACE_ID} ({'✅ enabled' if NAVA_ENABLED else '❌ disabled'})",
             "audio_narration": "Silent placeholder (local generation)",
             "subtitles": "Whisper API (automatyczna transkrypcja)",
@@ -2246,7 +2334,7 @@ def index():
             "checkpoint_resume": "Pause/resume – wznowienie od ostatniego etapu"
         },
         "endpoints": {
-            "POST /render-sequence": "Uruchomienie renderowania (HunyuanVideo)",
+            "POST /render-sequence": "Uruchomienie renderowania (Wan2.2)",
             "POST /nava-generate": "Generowanie wideo NAVA (text-to-video)",
             "GET /tasks/<job_id>": "Status renderowania",
             "POST /resume/<job_id>": "Wznowienie wstrzymanego zadania od checkpointu",
@@ -2274,7 +2362,7 @@ except Exception as val_err:
 # ---------------------------------------------------------------------------
 # STARTUP INITIALIZATION (runs on import by Gunicorn or direct execution)
 # ---------------------------------------------------------------------------
-logger.info("🚀 Startup HunyuanVideo API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
+logger.info("🚀 Startup Wan2.2 API v4.0 (Napisy + Watermark + Plansza + Checkpoint/Resume)")
 logger.info(f"📁 Storage: {STORAGE_DIR}")
 logger.info(f"🗄️  Database: {DB_PATH}")
 
