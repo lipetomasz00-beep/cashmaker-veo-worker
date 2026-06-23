@@ -919,7 +919,7 @@ def generate_video_segment(prompt, aspect_ratio="9:16"):
     """Generuje pojedynczy klip wideo (Wan2.2) i zwraca lokalną ścieżkę tymczasową."""
     logger.info(f"🎬 Generowanie segmentu HunyuanVideo: {prompt[:50]}...")
     temp_file = os.path.join(tempfile.gettempdir(), f"seg_{os.urandom(4).hex()}.mp4")
-    generate_wan_video(prompt, temp_file)
+    generate_hunyuan_video_segment(prompt, temp_file)
     return temp_file
 
 
@@ -1626,7 +1626,7 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             story_prompt = build_story_prompt(topic, narration_for_prompt)
 
             logger.info("🎥 Generowanie głównego wideo 18s (Wan2.2)...")
-            generate_wan_video(story_prompt, main_video_path)
+            generate_hunyuan_video_segment(story_prompt, main_video_path)
 
             segment_files.append(main_video_path)
             logger.info("✅ Główne wideo 18s gotowe")
