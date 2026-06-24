@@ -2199,10 +2199,7 @@ def auto_retry_worker():
 
 @app.route('/videos/<path:filename>')
 def serve_video(filename):
-    """GET /videos/<filename>"""
-    auth_error = require_api_key()
-    if auth_error:
-        return auth_error
+    """GET /videos/<filename> - PUBLIC ACCESS (no auth required)"""
     return send_from_directory(STORAGE_DIR, filename)
 
 
