@@ -536,14 +536,16 @@ def save_render_to_db(job_id, topic, status, video_url=None, error=None, video_d
     completed_at = datetime.utcnow() if status in ['success', 'failed'] else None
     c.execute('''INSERT OR REPLACE INTO renders
                  (job_id, topic, status, video_url, error, video_duration, created_at, completed_at,
-                  current_stage, checkpoint_data, paused_at, paused_reason)
+                  current_stage, checkpoint_data, paused_at, paused_reason, retry_count, next_retry_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?,
                   COALESCE((SELECT current_stage  FROM renders WHERE job_id = ?), NULL),
                   COALESCE((SELECT checkpoint_data FROM renders WHERE job_id = ?), NULL),
                   COALESCE((SELECT paused_at       FROM renders WHERE job_id = ?), NULL),
-                  COALESCE((SELECT paused_reason   FROM renders WHERE job_id = ?), NULL))''',
+                  COALESCE((SELECT paused_reason   FROM renders WHERE job_id = ?), NULL),
+                  COALESCE((SELECT retry_count     FROM renders WHERE job_id = ?), 0),
+                  COALESCE((SELECT next_retry_at   FROM renders WHERE job_id = ?), NULL))''',
               (job_id, topic, status, video_url, error, video_duration, datetime.utcnow(), completed_at,
-               job_id, job_id, job_id, job_id))
+               job_id, job_id, job_id, job_id, job_id, job_id))
     conn.commit()
     conn.close()
 
