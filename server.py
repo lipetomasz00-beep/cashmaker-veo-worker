@@ -8,6 +8,7 @@ import hashlib
 import requests
 import tempfile
 import sys
+import traceback
 import subprocess
 import threading
 import sqlite3
@@ -775,18 +776,31 @@ def build_story_prompt(topic: str, narration: dict) -> str:
 
     gemini_prompt = f"""You are a professional video director creating a single 18-second cinematic video for LTX 2.3 text-to-video model.
 
+CRITICAL REQUIREMENTS:
+- Format: VERTICAL 9:16 aspect ratio (portrait/mobile)
+- Duration: Exactly 18 seconds
+- Style: Professional, cinematic, high-quality
+- Character: Consistent throughout entire video
+- Lighting: Studio/professional lighting with warm tones
+- Camera: Smooth movements, no jerky cuts
+
 Topic: {topic}
 Hook (0-6s): {hook_text}
 Problem (6-12s): {problem_text}
 Solution (12-18s): {solution_text}
 
 Create ONE cohesive LTX 2.3 video prompt that:
-1. Covers all three narrative phases in a single continuous shot or seamless transitions
-2. Maintains a consistent character, environment, and visual style throughout
-3. Uses professional, cinematic language suitable for a high-quality video model
-4. Includes specific visual details (lighting, camera movement, props, colors)
-5. Emphasizes the emotional arc: tension → discovery → resolution
-6. Is concise but vivid (150-250 words)
+1. Explicitly mentions VERTICAL 9:16 aspect ratio at the start
+2. Covers all three narrative phases in seamless transitions
+3. Maintains a consistent character, environment, and visual style throughout
+4. Uses professional, cinematic language suitable for a high-quality video model
+5. Includes specific visual details (lighting, camera movement, props, colors, depth)
+6. Emphasizes the emotional arc: tension → discovery → resolution
+7. Specifies "vertical portrait format" or "9:16 aspect ratio" in the description
+8. Is vivid and detailed (200-300 words)
+
+EXAMPLE FORMAT:
+"Vertical 9:16 portrait video. Professional woman in modern office, warm studio lighting. 0-6s: She looks stressed at financial documents on desk. 6-12s: She discovers solution on smartphone showing green growth charts. 12-18s: She smiles with relief, looking confident. Consistent character, smooth camera movements, 4K quality, professional."
 
 Return ONLY the video prompt, no explanations or JSON."""
 
@@ -1210,10 +1224,8 @@ def generate_parler_tts_narration(narration_texts, job_id, duration_per_scene=6.
                 
             except Exception as e:
                 logger.error(f"❌ Parler TTS narration failed for {scene_key}: {e}")
-                logger.warning(f"⚠️ Falling back to silent audio for {scene_key}")
-                # Fallback to silent audio
-                silent_audio = generate_silent_audio_narration({scene_key: narration_texts[scene_key]}, job_id, duration_per_scene)
-                audio_files[scene_key] = silent_audio[scene_key]
+                logger.error(f"Full error traceback: {traceback.format_exc()}")
+                raise RuntimeError(f"Parler TTS failed for {scene_key}: {e}") from e
         
         return audio_files
         
