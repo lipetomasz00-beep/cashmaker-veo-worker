@@ -1130,6 +1130,7 @@ def generate_parler_tts_narration(narration_texts, job_id, duration_per_scene=6.
     """Generate real voice narration using Parler TTS Mini (multilingual).
     
     Uses Polish Alex voice (speaker_id: 25849) for professional narration.
+    Optimized for CPU (no GPU required).
     Falls back to silent audio if TTS fails.
     """
     try:
@@ -1137,10 +1138,23 @@ def generate_parler_tts_narration(narration_texts, job_id, duration_per_scene=6.
         from transformers import AutoTokenizer
         import torch
         
-        logger.info("🎙️ Initializing Parler TTS Mini (Polish Alex)...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("🎙️ Initializing Parler TTS Mini (Polish Alex - CPU optimized)...")
+        
+        # Force CPU mode for Railway (no GPU available)
+        device = "cpu"
+        torch.set_num_threads(4)  # Use 4 CPU threads for faster inference
+        
         model_name = "parler-tts/parler-tts-mini-multilingual-v1.1"
-        model = ParlerTTSForConditionalGeneration.from_pretrained(model_name).to(device)
+        logger.info(f"📥 Loading model: {model_name}")
+        
+        # Load model with optimizations for CPU
+        model = ParlerTTSForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True
+        ).to(device)
+        model.eval()  # Set to evaluation mode
+        
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         
         # Polish Alex voice description (speaker_id: 25849)
@@ -1165,7 +1179,7 @@ def generate_parler_tts_narration(narration_texts, job_id, duration_per_scene=6.
                 input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
                 prompt_input_ids = tokenizer(voice_description, return_tensors="pt").input_ids.to(device)
                 
-                # Generate audio
+                # Generate audio with CPU optimizations
                 with torch.no_grad():
                     generation = model.generate(
                         input_ids=input_ids,
