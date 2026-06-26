@@ -1126,6 +1126,89 @@ def generate_nava_video(
 
 
 
+def generate_parler_tts_narration(narration_texts, job_id, duration_per_scene=6.0):
+    """Generate real voice narration using Parler TTS Mini (multilingual).
+    
+    Uses Polish Alex voice (speaker_id: 25849) for professional narration.
+    Falls back to silent audio if TTS fails.
+    """
+    try:
+        from parler_tts import ParlerTTSForConditionalGeneration
+        from transformers import AutoTokenizer
+        import torch
+        
+        logger.info("🎙️ Initializing Parler TTS Mini (Polish Alex)...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_name = "parler-tts/parler-tts-mini-multilingual-v1.1"
+        model = ParlerTTSForConditionalGeneration.from_pretrained(model_name).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # Polish Alex voice description (speaker_id: 25849)
+        voice_description = "A male voice with a Polish accent, speaking clearly and professionally at normal speed."
+        
+        audio_files = {}
+        
+        for scene_key in narration_texts.keys():
+            audio_file = os.path.join(tempfile.gettempdir(), f"narration_{scene_key}_{job_id}.mp3")
+            
+            if os.path.exists(audio_file):
+                logger.info(f"⏩ Narration {scene_key} already exists – skipping")
+                duration = get_audio_duration(audio_file)
+                audio_files[scene_key] = {"path": audio_file, "duration": duration, "text": narration_texts[scene_key]}
+                continue
+            
+            try:
+                text = narration_texts[scene_key]
+                logger.info(f"🎙️ Generating Parler TTS narration for {scene_key}: {text[:50]}...")
+                
+                # Tokenize input
+                input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
+                prompt_input_ids = tokenizer(voice_description, return_tensors="pt").input_ids.to(device)
+                
+                # Generate audio
+                with torch.no_grad():
+                    generation = model.generate(
+                        input_ids=input_ids,
+                        prompt_input_ids=prompt_input_ids,
+                        do_sample=True,
+                        temperature=1.0,
+                        top_p=0.95,
+                        max_length=1024
+                    )
+                
+                # Save audio as WAV first
+                import scipy.io.wavfile as wavfile
+                audio_np = generation.cpu().numpy().squeeze()
+                wav_file = audio_file.replace('.mp3', '.wav')
+                wavfile.write(wav_file, 24000, (audio_np * 32767).astype('int16'))
+                
+                # Convert WAV to MP3 using FFmpeg
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y", "-i", wav_file,
+                    "-codec:a", "libmp3lame", "-q:a", "4", audio_file
+                ]
+                subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                os.remove(wav_file)
+                
+                duration = get_audio_duration(audio_file)
+                logger.info(f"✅ Narration {scene_key} generated: {duration:.1f}s")
+                audio_files[scene_key] = {"path": audio_file, "duration": duration, "text": text}
+                
+            except Exception as e:
+                logger.error(f"❌ Parler TTS narration failed for {scene_key}: {e}")
+                logger.warning(f"⚠️ Falling back to silent audio for {scene_key}")
+                # Fallback to silent audio
+                silent_audio = generate_silent_audio_narration({scene_key: narration_texts[scene_key]}, job_id, duration_per_scene)
+                audio_files[scene_key] = silent_audio[scene_key]
+        
+        return audio_files
+        
+    except Exception as e:
+        logger.error(f"❌ Parler TTS initialization failed: {e}")
+        logger.warning("⚠️ Falling back to silent audio for all narration")
+        return generate_silent_audio_narration(narration_texts, job_id, duration_per_scene)
+
+
 def generate_silent_audio_narration(narration_texts, job_id, duration_per_scene=6.0):
     """Create silent MP3 placeholder files instead of calling ElevenLabs.
 
@@ -1698,8 +1781,17 @@ def render_sequence_background(job_id, raw_data, webhook_url=None, resume_from=N
             logger.info("🎙️ Generowanie cichych ścieżek zastępczych...")
 
         narration_texts = custom_narration if custom_narration else NARRATION_TEMPLATES
-        audio_files_dict = generate_silent_audio_narration(narration_texts, job_id)
-        logger.info("✅ Ciche ścieżki zastępcze gotowe")
+        
+        if SKIP_NARRATION:
+            audio_files_dict = generate_silent_audio_narration(narration_texts, job_id)
+            logger.info("⏭️  SKIP_NARRATION=true – using silent audio")
+        else:
+            try:
+                audio_files_dict = generate_parler_tts_narration(narration_texts, job_id)
+                logger.info("✅ Parler TTS narration generated successfully")
+            except Exception as e:
+                logger.error(f"❌ Parler TTS failed: {e} – falling back to silent audio")
+                audio_files_dict = generate_silent_audio_narration(narration_texts, job_id)
 
         check_job_timeout()
         srt_file = None
